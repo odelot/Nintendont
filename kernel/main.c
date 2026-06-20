@@ -65,6 +65,8 @@ extern vu32 bbaEmuWanted;
 extern char __bss_start, __bss_end;
 extern char __di_stack_addr, __di_stack_size;
 
+#include "ra_module.h"
+
 u32 virtentry = 0;
 u32 drcAddress = 0;
 u32 drcAddressAligned = 0;
@@ -258,6 +260,11 @@ int _main( int argc, char *argv[] )
 	PatchInit();
 
 	SOCKInit();
+
+	/* RetroAchievements: synchronous pre-boot handshake. Runs BEFORE we tell
+	 * the PPC loader we're ready, so the game launch waits for it (Phase 2a). */
+	RA_PreBootHandshake();
+
 //Tell PPC side we are ready!
 	cc_ahbMemFlush(1);
 	mdelay(1000);
@@ -330,6 +337,11 @@ int _main( int argc, char *argv[] )
 		else if (!ConfigGetConfig(NIN_CFG_WIIU_WIDE) && isWidescreen)
 			write32(0xd8006a0, 0x30000002), mask32(0xd8006a8, 0, 2);
 	}
+
+	/* RetroAchievements memory server — Phase 0 proof of life. Spawns a
+	 * background thread that drives the real EXI bus to the ESP32 in Slot B.
+	 * See RA_PORT_PLAN.md / ra_module.c. */
+	RA_Init();
 
 	while (1)
 	{

@@ -32,6 +32,19 @@ _start:
 
 	stmw	r3,24(r1)		# saves r3-r31
 
+	# --- RetroAchievements: per-frame VBlank counter ---------------------
+	# This _start runs once per game frame (hooked at OSSleepThread/PADHook).
+	# Bump a u32 at MEM1 0x1B00 via an UNCACHED store (0xC0001B00) so the
+	# Starlet (ra_module) sees every increment without cache coherency games.
+	# 0x1B00 lives in the zeroed cheats area reserved by the codehandler load,
+	# just above the codehandler code+codelist. (0x2FF8 — the Wii's choice —
+	# is ABOVE POffset on GameCube, hence the earlier garbage base value.)
+	lis	r3, 0xC000
+	lwz	r4, 0x1B00(r3)
+	addi	r4, r4, 1
+	stw	r4, 0x1B00(r3)
+	# ---------------------------------------------------------------------
+
 	mfmsr	r20
 	ori	r26,r20,0x2000		#enable floating point ?
 	andi.	r26,r26,0xF9FF

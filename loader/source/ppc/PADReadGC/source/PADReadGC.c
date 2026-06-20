@@ -84,6 +84,13 @@ const s8 DEADZONE = 0x1A;
 	else if(tmp_stick16 < -0x80) tmp_stick8 = -0x80; \
 	else tmp_stick8 = (s8)tmp_stick16;
 
+/* RetroAchievements overlay: when the d2x/RA kernel raises the flag at MEM1
+ * 0x1B08 (achievement celebration), draw a small white block straight into the
+ * XFB the VI is scanning. Done here on the PPC (uncached writes, interrupts on)
+ * instead of from the Starlet, to avoid the cross-core race that froze the v1
+ * version. Set to 0 to compile the blit out entirely. */
+#define RA_OVERLAY_DRAW 0
+
 u32 PADRead(u32 calledByGame)
 {
 	// Registers r1,r13-r31 automatically restored if used.
@@ -1558,6 +1565,31 @@ u32 PADRead(u32 calledByGame)
 			Pad[chan].err = ((used & (1<<chan)) && *SIInited) ? 0 : -1;
 	}
 	*PadUsed = (*SIInited ? used : 0);
+
+#if RA_OVERLAY_DRAW
+	if (calledByGame)
+	{
+		u32 reg = *(vu32*)0xCC00201C;            /* VI top-field base register */
+		u32 fbb = reg & 0x00FFFFFF;              /* FBB field (bits 0-23)       */
+		u32 xfb = (reg & 0x10000000) ? (fbb << 5) : fbb;  /* POFF-aware decode  */
+		*(vu32*)0xC0001B0C = reg;                /* DIAG: publish raw VI_TFBL   */
+		*(vu32*)0xC0001B10 = xfb;                /* DIAG: publish decoded XFB   */
+		/* DIAGNOSTIC: draw the block ALWAYS (ignore the celebration flag) so we
+		 * can see whether a PADRead-time blit shows at all. XFB is YUYV 4:2:2
+		 * (1 u32 = 2 px), 0xEB80EB80 = white; 640-wide => 320 u32/row; block at
+		 * x=24px (12 u32), y=24..55, w=32px. Uncached so the VI sees it. */
+		if (xfb >= 0x1000 && (xfb + 64u * 1280u) < 0x01800000)
+		{
+			vu32 *fb = (vu32*)(0xC0000000 | xfb);
+			u32 yy, xx;
+			for (yy = 24; yy < 56; yy++)
+			{
+				vu32 *row = fb + yy * 320u + 12u;
+				for (xx = 0; xx < 16u; xx++) row[xx] = 0xEB80EB80;
+			}
+		}
+	}
+#endif
 
 	memFlush = (u32)HIDMotor;
 	asm volatile("dcbf 0,%0" : : "b"(memFlush) : "memory");
