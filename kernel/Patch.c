@@ -38,6 +38,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #include "codehandler.h"
 #include "codehandleronly.h"
 #include "ff_utf8.h"
+#include "ra_module.h"
 
 //#define DEBUG_DSP  // Very slow!! Replace with raw dumps?
 
@@ -1669,11 +1670,15 @@ void DoPatches( char *Buffer, u32 Length, u32 DiscOffset )
 		FPATCH_OSSleepThread | FPATCH_GXBegin | FPATCH_GXDrawDone;
 #ifdef CHEATS
 	u32 cheatsWanted = 0, debuggerWanted = 0;
+	/* RetroAchievements: force the codehandler load + OSSleepThread hook so our
+	 * per-frame VBlank counter (incremented inside codehandleronly.s) runs even
+	 * when the user did not enable cheats. Toggle via RA_USE_VBI in ra_module.h. */
+	u32 raVbiForce = RA_USE_VBI ? 1 : 0;
 	if(ConfigGetConfig(NIN_CFG_CHEATS))
 		cheatsWanted = 1;
 	if(!IsWiiU() && ConfigGetConfig(NIN_CFG_DEBUGGER))
 		debuggerWanted = 1;
-	if(cheatsWanted || debuggerWanted)
+	if(cheatsWanted || debuggerWanted || raVbiForce)
 		PatchCount &= ~FPATCH_OSSleepThread;
 	/* So this can be used but for now we just use PADRead */
 	/*if( (IsWiiU() && ConfigGetConfig(NIN_CFG_CHEATS)) ||
@@ -3760,7 +3765,7 @@ void DoPatches( char *Buffer, u32 Length, u32 DiscOffset )
 			PatchWideMulti(MTXLightPerspectiveOffset + 0x24, 27);
 		}
 	}
-	if(cheatsWanted || debuggerWanted)
+	if(cheatsWanted || debuggerWanted || raVbiForce)
 	{
 		//setup jump to codehandler stub
 		if(OSSleepThreadHook || PADHook)
@@ -3792,6 +3797,12 @@ void DoPatches( char *Buffer, u32 Length, u32 DiscOffset )
 			dbgprintf("Possible Code Size: %08x\r\n", cheats_area);
 			memset((void*)cheats_start, 0, cheats_area);
 		}
+		/* RA: flush the codehandler code at 0x1000 + the zeroed cheats area
+		 * (which holds the 0x2FF8 VBlank counter) out of the Starlet D-cache so
+		 * the PPC executes the real code and the counter starts at 0. The stock
+		 * cheats path only syncs the GCT (3816), which RA-only mode never loads,
+		 * so without this the PPC could run stale garbage at 0x1000. */
+		sync_after_write((void*)0x1000, (cheats_start + cheats_area) - 0x1000);
 		//copy in gct file if requested
 		if( cheatsWanted && TRIGame != TRI_SB && useipl == 0 )
 		{

@@ -30,6 +30,11 @@
 extern u32 RealDiscCMD;   /* != 0 => physical disc (RealDI.c) */
 extern u32 FSTMode;       /* != 0 => folder/FST game (FST.c) */
 
+/* Nintendont's SD/USB disk code (diskio.c, RealDI.c) drives GPIO_SLOT_LED as an
+ * access indicator when this is set. We suppress it during the achievement
+ * celebration so our blink isn't masked by streaming activity (see led_celebrate). */
+extern bool access_led;
+
 /* ------------------------------------------------------------------------
  * EXI wiring — real Hollywood controller (Starlet view).
  *
@@ -83,6 +88,42 @@ static void led_blink(int count, int ms)
 		led_off(); mdelay(ms);
 	}
 }
+
+/* ------------------------------------------------------------------------
+ * Achievement celebration — non-blocking, driven over the SNAPSHOT loop so the
+ * LED blink, screen overlay and rumble all run together for a couple seconds
+ * without stalling the snapshot pipeline (the old blocking led blink would have
+ * frozen the overlay redraw). On unlock the loop sets ra_celeb = RA_CELEB_FRAMES
+ * and counts down, applying each effect per iteration. Each gated by its toggle.
+ * ------------------------------------------------------------------------ */
+#define RA_CELEB_FRAMES   120u   /* total celebration length (loop iterations) */
+#define RA_RUMBLE_FRAMES   24u   /* rumble only for the first part (~0.5 s) */
+static u32 ra_celeb = 0;
+
+#if RA_USE_RUMBLE
+/* Kernel-owned rumble flag PADReadGC polls (MEM1, codehandler cheats area). */
+static vu32 * const ra_rumble_flag = (vu32*)RA_RUMBLE_FLAG_PHYS;
+static void ra_set_rumble(u32 on)
+{
+	*ra_rumble_flag = on;
+	sync_after_write((void*)ra_rumble_flag, 4);
+}
+#endif
+
+#if RA_USE_OVERLAY
+/* Achievement overlay (kernel side): just raise/lower a flag in the codehandler
+ * cheats area. The actual blit happens on the PPC in PADReadGC — it reads this
+ * flag (uncached), then VI_TFBL, and writes a small white block straight into
+ * the displayed XFB. Drawing on the PPC (not the Starlet) avoids the cross-core
+ * race + 50 KB flush that froze the earlier Starlet-blit version, and runs with
+ * interrupts on (outside the codehandler's IRQ-off window). */
+static vu32 * const ra_overlay_flag = (vu32*)RA_OVERLAY_FLAG_PHYS;
+static void ra_set_overlay(u32 on)
+{
+	*ra_overlay_flag = on;
+	sync_after_write((void*)ra_overlay_flag, 4);
+}
+#endif
 
 /* ------------------------------------------------------------------------
  * Minimal EXI driver — direct register access (kernel/SVC mode).
@@ -288,7 +329,43 @@ static char ra_hexd(u8 n);   /* defined later */
 
 static u32 ra_watchlist[RA_MAX_WATCH] __attribute__((aligned(32)));
 static u16 ra_watch_count = 0;
-static u32 ra_frame_counter = 0;
+static u32 ra_frame_counter = 0;   /* delivery count (heartbeat/diag) */
+
+/* Frame clock shipped in the SNAPSHOT header so the ESP's rc_client_do_frame
+ * debt catch-up advances at the right rate.
+ *
+ * Two sources, selected automatically (see RA_USE_VBI in ra_module.h):
+ *   1. VBlank counter (preferred): the codehandler bumps a u32 at MEM1 0x2FF8
+ *      once per game frame; we poll it. This is a TRUE per-game-frame clock —
+ *      identical to how the Dolphin emulator drives RA, the most faithful to
+ *      how achievements (esp. frame-count timers) are authored.
+ *   2. HW_TIMER 60 Hz wall-clock fallback (Hollywood timer, 1 tick ≈ 526.7 ns):
+ *      used until/unless the VBI counter proves alive, so we always have a sane
+ *      monotonic clock even if the game lacks the OSSleepThread hook pattern. */
+#define RA_FRAME_US     16667u
+#define RA_FRAME_TICKS  ((RA_FRAME_US * 1000u) / 527u)   /* ≈ 31626 ticks/frame */
+static u32 ra_game_frame = 0;
+static u32 ra_start_tick = 0;
+
+#if RA_USE_VBI
+/* VBlank counter state. ra_vbi_live latches once the PPC counter has advanced,
+ * after which we trust it as the frame source (and never fall back, so a paused
+ * game correctly stops do_frame instead of the wall-clock running on). */
+static u32 ra_vbi_last  = 0;   /* last counter value read */
+static u32 ra_vbi_base  = 0;   /* counter value when it first went live */
+static int ra_vbi_live  = 0;   /* 1 once the counter has been seen to advance */
+
+/* Read the per-frame VBlank counter the codehandler increments at MEM1 0x2FF8.
+ * Single fixed address polled repeatedly → the Starlet D-cache would pin a
+ * stale value, so invalidate the line first (safe: 0x2FF8 is in the reserved
+ * codehandler area, never touched by the DI load thread). 0-based physical. */
+static u32 ra_read_vbi(void)
+{
+	u32 a = RA_VBI_COUNTER_PHYS & ~3u;
+	sync_before_read((void*)(a & ~0x1Fu), 0x20);
+	return read32(a);
+}
+#endif
 static u32 ra_pending_q[RA_ADDR_QUERY_MAX] __attribute__((aligned(32)));
 static u16 ra_pending_qn = 0;
 
@@ -336,6 +413,7 @@ static u8 ra_read_mem1(u32 addr)
 /* Append helpers for debug strings. */
 static u32 ra_apphex32(char *d, u32 v) { int i; for (i = 7; i >= 0; i--) d[7 - i] = ra_hexd((v >> (i * 4)) & 0xF); return 8; }
 static u32 ra_appdec(char *d, u32 v)   { char t[10]; u32 n = 0, o = 0; if (!v) { d[0] = '0'; return 1; } while (v) { t[n++] = (char)('0' + v % 10); v /= 10; } while (n) d[o++] = t[--n]; return o; }
+static u32 ra_apphex8(char *d, u32 v)  { u32 i; for (i = 0; i < 8; i++) { u32 nib = (v >> ((7 - i) * 4)) & 0xF; d[i] = (char)(nib < 10 ? '0' + nib : 'a' + nib - 10); } return 8; }
 
 /* Fetch one watchlist chunk via the legacy 2-transaction pattern — NOT Phase B
  * (matches the canonical d2x ra-module's GET_CHUNK): T1 asks the ESP to prepare
@@ -504,7 +582,8 @@ static int ra_send_snapshot(void)
 	hdr->magic       = RA_MAGIC_GC_TO_ESP;
 	hdr->command     = RA_CMD_SNAPSHOT;
 	hdr->payload_len = sizeof(ra_snapshot_header_t) + count;
-	snap->frame_counter = ++ra_frame_counter;   /* no VBI hook yet -> fire counter */
+	++ra_frame_counter;                          /* delivery count */
+	snap->frame_counter = ra_game_frame;         /* real-time 60 Hz frame clock */
 	snap->addr_count    = count;
 	snap->wl_seq        = ra_wl_seq;             /* Phase D2 sync echo */
 	for (i = 0; i < count; i++)
@@ -558,6 +637,13 @@ static u32 RA_PollThread(void *arg)
 	led_setup();
 	for (i = 0; i < 3; i++) { led_on(); mdelay(150); led_off(); mdelay(150); }
 
+	/* Reserve the disc-slot LED exclusively for achievement notifications:
+	 * disable Nintendont's SD/USB access indicator so the LED stays DARK during
+	 * play and only lights when led_celebrate() flashes on an unlock (like the
+	 * Wii). Without this the constant game streaming holds the LED on. */
+	access_led = false;
+	led_off();
+
 	/* Let the game boot before we start (no VBI game-alive signal yet). With
 	 * RA at priority 0x30 the main loop preempts our EXI bursts, so this only
 	 * needs to cover the apploader/boot window, not the whole session. */
@@ -596,7 +682,32 @@ static u32 RA_PollThread(void *arg)
 	 * Handle Phase D2 in-game RESYNC (full re-fetch) and achievement events. */
 	{
 		u32 frames = 0;
+		u32 next_fire;
+		ra_start_tick = read32(HW_TIMER);
+		next_fire     = ra_start_tick + RA_FRAME_TICKS;
 		for (;;) {
+			/* Frame clock. Baseline: 60 Hz HW_TIMER wall-clock (u32 subtraction
+			 * wraps correctly within the timer's ~38-min period). */
+			u32 hw_frame = (read32(HW_TIMER) - ra_start_tick) / RA_FRAME_TICKS;
+#if RA_USE_VBI
+			{
+				u32 vbi = ra_read_vbi();
+				if (!ra_vbi_live) {
+					/* Trust the PPC counter only once we've seen it advance. */
+					if (ra_vbi_last == 0)        ra_vbi_last = vbi;
+					else if (vbi != ra_vbi_last) {
+						ra_vbi_live = 1;
+						ra_vbi_base = vbi;   /* zero our frame count at go-live */
+						ra_debug("GC-RA VBI counter live (true game frames)");
+					}
+				}
+				ra_game_frame = ra_vbi_live ? (vbi - ra_vbi_base) : hw_frame;
+				ra_vbi_last = vbi;
+			}
+#else
+			ra_game_frame = hw_frame;
+#endif
+
 			(void)ra_send_snapshot();
 #if !RA_SNAP_TEST_CAP
 			for (i = 0; i < 12 && ra_pending_qn > 0; i++)
@@ -618,11 +729,31 @@ static u32 RA_PollThread(void *arg)
 			ra_resync_pending = 0;
 #endif
 
-			/* Achievement unlocked — celebrate on the LED + log. */
+			/* Achievement unlocked — kick off the (non-blocking) celebration. */
 			if (ra_ach_fired) {
 				ra_ach_fired = 0;
-				led_blink(3, 100);
+				ra_celeb = RA_CELEB_FRAMES;
+#if RA_USE_OVERLAY
+				ra_set_overlay(1);   /* PADReadGC blits the block while this is set */
+#endif
 				ra_debug("GC-RA *** ACHIEVEMENT UNLOCKED ***");
+			}
+			/* Drive the celebration a step each loop iteration: LED blink (+
+			 * rumble pulse if enabled). Overlay is flag-gated and drawn PPC-side. */
+			if (ra_celeb > 0) {
+				if ((ra_celeb / 6) & 1) led_on(); else led_off();
+#if RA_USE_RUMBLE
+				ra_set_rumble(ra_celeb > RA_CELEB_FRAMES - RA_RUMBLE_FRAMES);
+#endif
+				if (--ra_celeb == 0) {
+					led_off();
+#if RA_USE_OVERLAY
+					ra_set_overlay(0);
+#endif
+#if RA_USE_RUMBLE
+					ra_set_rumble(0);
+#endif
+				}
 			}
 
 			/* Heartbeat once a second: alive + count + applied seq. */
@@ -636,10 +767,44 @@ static u32 RA_PollThread(void *arg)
 				o += ra_appdec(m + o, ra_watch_count);
 				m[o++]=' ';m[o++]='s';m[o++]='q';m[o++]='=';
 				o += ra_appdec(m + o, ra_wl_seq);
+				m[o++]=' ';m[o++]='g';m[o++]='f';m[o++]='=';
+				o += ra_appdec(m + o, ra_game_frame);
+#if RA_USE_VBI
+				/* VBI diagnostics: raw PPC counter + live flag. When live, gf
+				 * tracks vb-base; compare vb's rate to gf to confirm ~60 Hz. */
+				m[o++]=' ';m[o++]='v';m[o++]='b';m[o++]='=';
+				o += ra_appdec(m + o, ra_vbi_last);
+				m[o++]=' ';m[o++]='L';m[o++]='v';m[o++]='=';
+				o += ra_appdec(m + o, (u32)ra_vbi_live);
+#endif
+#if RA_USE_OVERLAY
+				/* Overlay diagnostics: raw VI_TFBL + decoded XFB addr that
+				 * PADReadGC published (read 0-based, single addr -> sync). */
+				sync_before_read((void*)0x1B00, 0x40);
+				m[o++]=' ';m[o++]='t';m[o++]='f';m[o++]='=';
+				o += ra_apphex8(m + o, read32(0x1B0Cu));
+				m[o++]=' ';m[o++]='x';m[o++]='f';m[o++]='=';
+				o += ra_apphex8(m + o, read32(0x1B10u));
+#endif
 				m[o] = 0;
 				ra_debug(m);
 			}
-			mdelay(33);
+
+			/* Pace to ~60 Hz real time. If a frame's work overran, re-anchor
+			 * instead of burning through a backlog (the game frame clock above
+			 * already advanced, so the ESP catches up via debt). */
+			{
+				u32 now = read32(HW_TIMER);
+				s32 togo = (s32)(next_fire - now);
+				if (togo > 0) {
+					udelay((int)(((u32)togo * 527u) / 1000u));
+					next_fire += RA_FRAME_TICKS;
+				} else if (-togo > (s32)RA_FRAME_TICKS) {
+					next_fire = now + RA_FRAME_TICKS;
+				} else {
+					next_fire += RA_FRAME_TICKS;
+				}
+			}
 		}
 	}
 
