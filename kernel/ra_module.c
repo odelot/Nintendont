@@ -115,17 +115,16 @@ static void ra_set_rumble(u32 on)
 #endif
 
 #if RA_USE_OVERLAY
-/* Achievement overlay (kernel side): just raise/lower a flag in the codehandler
- * cheats area. The actual blit happens on the PPC in PADReadGC — it reads this
- * flag (uncached), then VI_TFBL, and writes a small white block straight into
- * the displayed XFB. Drawing on the PPC (not the Starlet) avoids the cross-core
- * race + 50 KB flush that froze the earlier Starlet-blit version, and runs with
- * interrupts on (outside the codehandler's IRQ-off window). */
-static vu32 * const ra_overlay_flag = (vu32*)RA_OVERLAY_FLAG_PHYS;
-static void ra_set_overlay(u32 on)
+/* Trophy overlay (kernel side): just raise/lower a flag the codehandler polls.
+ * The codehandler (PPC, per frame) draws the 32x32 gold badge into both the
+ * current and previous VI_TFBL whenever this flag is non-zero — mirrors the
+ * working WiiFlow ra_trophy_hook. Flag lives in the codehandler cheatdata
+ * scratch (fixed at 0x1008). */
+static vu32 * const ra_trophy_flag = (vu32*)RA_TROPHY_FLAG_PHYS;
+static void ra_set_trophy(u32 on)
 {
-	*ra_overlay_flag = on;
-	sync_after_write((void*)ra_overlay_flag, 4);
+	*ra_trophy_flag = on;
+	sync_after_write((void*)ra_trophy_flag, 4);
 }
 #endif
 
@@ -359,10 +358,11 @@ static u32 ra_vbi_last  = 0;   /* last counter value read */
 static u32 ra_vbi_base  = 0;   /* counter value when it first went live */
 static int ra_vbi_live  = 0;   /* 1 once the counter has been seen to advance */
 
-/* Read the per-frame VBlank counter the codehandler increments at MEM1 0x2FF8.
- * Single fixed address polled repeatedly → the Starlet D-cache would pin a
- * stale value, so invalidate the line first (safe: 0x2FF8 is in the reserved
- * codehandler area, never touched by the DI load thread). 0-based physical. */
+/* Read the per-frame VBlank counter the codehandler increments at MEM1 0x1004
+ * (codehandler cheatdata scratch). Single fixed address polled repeatedly → the
+ * Starlet D-cache would pin a stale value, so invalidate the line first (safe:
+ * 0x1004 is in the reserved codehandler area, never touched by the DI thread).
+ * 0-based physical. */
 static u32 ra_read_vbi(void)
 {
 	u32 a = RA_VBI_COUNTER_PHYS & ~3u;
@@ -745,23 +745,24 @@ static u32 RA_PollThread(void *arg)
 			if (ra_ach_fired) {
 				ra_ach_fired = 0;
 				ra_celeb = RA_CELEB_FRAMES;
-#if RA_USE_OVERLAY
-				ra_set_overlay(1);   /* PADReadGC blits the block while this is set */
-#endif
 				ra_debug("GC-RA *** ACHIEVEMENT UNLOCKED ***");
 			}
-			/* Blink while celebrating; otherwise hold the LED dark. */
+			/* Celebrate while ra_celeb > 0: 3 pulses (on for RA_BLINK_HALF,
+			 * off the next, ...). The LED and the trophy badge blink together
+			 * (the codehandler draws the badge whenever the flag is on). */
 			if (ra_celeb > 0) {
-				/* 3 pulses, starting ON (ra_celeb 48..1): on for the first
-				 * RA_BLINK_HALF, off the next, ... → exactly 3 blinks. */
-				if ((ra_celeb / RA_BLINK_HALF) & 1u) led_off(); else led_on();
+				u32 on = !((ra_celeb / RA_BLINK_HALF) & 1u);
+				if (on) led_on(); else led_off();
+#if RA_USE_OVERLAY
+				ra_set_trophy(on);
+#endif
 #if RA_USE_RUMBLE
 				ra_set_rumble(ra_celeb > RA_CELEB_FRAMES - RA_RUMBLE_FRAMES);
 #endif
 				if (--ra_celeb == 0) {
 					led_off();
 #if RA_USE_OVERLAY
-					ra_set_overlay(0);
+					ra_set_trophy(0);
 #endif
 #if RA_USE_RUMBLE
 					ra_set_rumble(0);
@@ -793,13 +794,14 @@ static u32 RA_PollThread(void *arg)
 				o += ra_appdec(m + o, (u32)ra_vbi_live);
 #endif
 #if RA_USE_OVERLAY
-				/* Overlay diagnostics: raw VI_TFBL + decoded XFB addr that
-				 * PADReadGC published (read 0-based, single addr -> sync). */
-				sync_before_read((void*)0x1B00, 0x40);
+				/* Trophy diagnostics: tf = raw VI_TFBL the codehandler reads
+				 * (published @0x1010 every frame); bx = badge-exec count (@0x1014,
+				 * bumped each time the badge actually drew → flag seen + TFBL ok). */
+				sync_before_read((void*)0x1000, 0x20);
 				m[o++]=' ';m[o++]='t';m[o++]='f';m[o++]='=';
-				o += ra_apphex8(m + o, read32(0x1B0Cu));
-				m[o++]=' ';m[o++]='x';m[o++]='f';m[o++]='=';
-				o += ra_apphex8(m + o, read32(0x1B10u));
+				o += ra_apphex8(m + o, read32(0x1010u));
+				m[o++]=' ';m[o++]='b';m[o++]='x';m[o++]='=';
+				o += ra_appdec(m + o, read32(0x1014u));
 #endif
 				m[o] = 0;
 				ra_debug(m);

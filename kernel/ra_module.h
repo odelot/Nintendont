@@ -41,40 +41,30 @@
  * (~0x1AB0). That whole area is memset to 0 + flushed when RA forces the
  * codehandler, and the game never touches Nintendont's reserved cheats space.
  *
- * NOTE: the Wii ra-module used 0x2FF8, but on GameCube that lands ABOVE
- * POffset (the patch area grows DOWN from PATCH_OFFSET_START = 0x2FF4), i.e.
- * in the patch-system's reserved 12-byte slot at 0x2FF4..0x3000 — NOT zeroed
- * and not ours. 0x1B00 sits safely inside the zeroed cheats region instead.
+ * Slots now live in the codehandler's cheatdata scratch (FIXED at the start of
+ * the blob, 0x1004/0x1008/0x100C), so they don't move as the codehandler grows
+ * (the trophy badge added a lot of code). Zeroed + unused without a GCT.
  * (RA overrides user GCT cheats when active, so GCT collision is moot.)
  * ------------------------------------------------------------------------ */
 #define RA_USE_VBI            1
-#define RA_VBI_COUNTER_PHYS   0x1B00u
+#define RA_VBI_COUNTER_PHYS   0x1004u
 
 /* ------------------------------------------------------------------------
- * Achievement celebration extras (feature toggles, default ON).
+ * Achievement TROPHY OVERLAY (feature toggle, default ON). v3 (2026-06-22):
+ * ported from the WORKING WiiFlow ra_trophy_hook.s. The BADGE is drawn on the
+ * PPC, inside the codehandler (runs per game frame), into BOTH the current and
+ * previous VI_TFBL so it survives double-buffering — the piece the earlier
+ * Starlet/PADReadGC attempts were missing. The kernel only raises a flag at
+ * RA_TROPHY_FLAG_PHYS during the celebration (in sync with the LED blink); the
+ * codehandler draws a 32x32 gold trophy badge in the top-left whenever the flag
+ * is set. RA_USE_OVERLAY gates whether the kernel raises the flag (the badge
+ * asm is always present but dormant when the flag stays 0).
  *
- * RA_USE_OVERLAY — draw a small flash block into the game's framebuffer on an
- *   unlock. v2 (2026-06-16): the kernel only raises a flag at RA_OVERLAY_FLAG_PHYS;
- *   the BLIT happens on the PPC in PADReadGC — it reads VI_TFBL (0xCC00201C),
- *   decodes the XFB address, and writes a small white block UNCACHED straight
- *   into the displayed framebuffer, with interrupts on. Drawing on the PPC (not
- *   the Starlet) avoids the cross-core race + 50 KB cache flush that froze the
- *   v1 Starlet-blit version.
- *
- * RA_USE_RUMBLE — buzz the controller(s) on an unlock (kernel raises a flag,
- *   PADReadGC forces MotorCommand). DISABLED for now (froze + isolating overlay):
- *   re-enabling needs the PADReadGC MotorCommand-force re-added (it was removed).
- *
- * RA shared slots live in the codehandler's zeroed cheats area (0x1B00 VBI,
- * 0x1B08 overlay flag) — reserved, never touched by the game. */
-/* DISABLED 2026-06-16: overlay still didn't show (white block never appeared) —
- * turned off so the build is the stable VBI+LED again. To re-enable BOTH this
- * and RA_OVERLAY_DRAW in PADReadGC.c must be set to 1 (kernel raises the flag /
- * logs tf=/xf=; PADReadGC does the actual blit + publishes the diag values). */
-#define RA_USE_OVERLAY        0
-#define RA_OVERLAY_FLAG_PHYS  0x1B08u   /* Starlet writes; PADReadGC reads (0xC0001B08) */
+ * RA_USE_RUMBLE — DISABLED (froze earlier; PADReadGC MotorCommand-force removed). */
+#define RA_USE_OVERLAY        1
+#define RA_TROPHY_FLAG_PHYS   0x1008u   /* Starlet writes; codehandler reads (0xC0001008) */
 #define RA_USE_RUMBLE         0
-#define RA_RUMBLE_FLAG_PHYS   0x1B10u   /* Starlet writes; PADReadGC reads (0xC0001B10) */
+#define RA_RUMBLE_FLAG_PHYS   0x1B10u   /* (rumble disabled) */
 
 /* Spawn the RA background thread. Call once from main(), before the kernel
  * main loop, after EXIInit()/the GPIO setup. */
