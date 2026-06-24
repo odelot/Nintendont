@@ -213,10 +213,16 @@ static int ra_xfer(const void *tx, u32 tx_len, void *rx, u32 rx_len)
 
 static int ra_wait_int(int ch, u32 timeout_ms)
 {
-	u32 ms = 0;
+	u32 us = 0, budget = timeout_ms * 1000u;
+	/* Poll at 250 us instead of 1 ms: the ESP asserts the INT quickly for the
+	 * small ADDR_RESPONSE passes, so 1 ms granularity wasted up to ~1 ms/pass
+	 * (~3-4 ms/snapshot over the multi-pass). udelay() still yields (timer +
+	 * mqueue_recv), so the kernel main loop keeps servicing the game during the
+	 * longer waits (e.g. the ~6-10 ms of a full do_frame). */
 	while (!(read32(RA_EXI_CSR(ch)) & RA_CSR_EXI_IRQ)) {
-		mdelay(1);
-		if (++ms >= timeout_ms) return -1;
+		udelay(250);
+		us += 250;
+		if (us >= budget) return -1;
 	}
 	return 0;
 }
@@ -280,17 +286,21 @@ static void ra_debug(const char *msg)
 	ra_imm_write(RA_CHAN, buf, sizeof(ra_gc_header_t) + 1 + n);
 	ra_deselect(RA_CHAN);
 
-	/* Fire-and-forget with no INT/sync: the ESP needs time to consume this
-	 * transaction and re-arm its SPI slave before the next one. Without a
-	 * settle, back-to-back ra_debug() calls race the ESP's re-arm and get
-	 * dropped (observed: only ~1 s-spaced messages survived). 150 ms is
-	 * generous for a short Serial.print at 250000 baud. Diagnostics only. */
-	mdelay(150);
+	/* Fire-and-forget with no INT/sync: the ESP needs a moment to consume this
+	 * transaction (a ~64-char Serial.print at 250000 baud ≈ 2.5 ms) and re-arm
+	 * its SPI slave before the next one. 150 ms was wildly over-generous (a
+	 * relic from the pre-protocol-stable days) and, since the heartbeat fires
+	 * this once/second INSIDE the snapshot loop, it was eating ~16% of df/s.
+	 * 10 ms is ~4x the Serial cost — plenty. Worst case if too short: an
+	 * occasional dropped DEBUG line (diagnostics only, never a hang). */
+	mdelay(10);
 }
 
 /* One IDENTIFY round-trip.
  * Returns 0 = OK (magic + device id match), 1 = magic OK but wrong id,
- * 2 = bad magic / EXI error. */
+ * 2 = bad magic / EXI error. (Unused since the GET_CHUNK Phase B conversion
+ * dropped the prime; kept for diagnostics/future use.) */
+static int ra_identify(void) __attribute__((unused));
 static int ra_identify(void)
 {
 	ra_gc_header_t hdr;
@@ -384,8 +394,10 @@ static u8  ra_ach_fired = 0;
 
 static u8 ra_snap_tx[16 + RA_MAX_WATCH + 32] __attribute__((aligned(32)));
 static u8 ra_snap_rx[RA_RESP_LEN]            __attribute__((aligned(32)));
-/* GET_CHUNK response: 6(esp_hdr)+6(chunk_hdr)+1024*4 = 4108 (one full chunk). */
-static u8 ra_chunk_rx[6 + 6 + RA_WATCHLIST_CHUNK_ADDRS * 4] __attribute__((aligned(32)));
+/* GET_CHUNK response via Phase B: 6(FF pad)+6(esp_hdr)+6(chunk_hdr)+1024*4.
+ * The leading 6-byte pad (GC_WRITE_PADDING the ESP prepends) lands at the start
+ * of the Phase B read, so the buffer needs the extra 6 vs the old 2-tx path. */
+static u8 ra_chunk_rx[6 + 6 + 6 + RA_WATCHLIST_CHUNK_ADDRS * 4] __attribute__((aligned(32)));
 
 /* Read one byte of GameCube system RAM (MEM1, 24 MB at 0x80000000).
  *
@@ -432,7 +444,10 @@ static int ra_fetch_watchlist_chunk(u16 chunk_index)
 	} tx;
 	ra_esp_header_t      resp;
 	ra_watchlist_chunk_t chunk;
-	u8  discard[16];
+	const u32 PAD = 6;   /* ESP prepends 6 FF (GC_WRITE_PADDING). With the legacy
+	                      * 2-tx those were eaten by T2's write phase; in Phase B
+	                      * the write is a SEPARATE CS-low, so the pad lands at the
+	                      * START of the read → the real response begins at +6. */
 	u16 i;
 
 	tx.hdr.magic       = RA_MAGIC_GC_TO_ESP;
@@ -440,14 +455,15 @@ static int ra_fetch_watchlist_chunk(u16 chunk_index)
 	tx.hdr.payload_len = sizeof(ra_watchlist_chunk_req_t);
 	tx.req.chunk_index = chunk_index;
 
-	if (ra_xfer(&tx, sizeof(tx), discard, sizeof(discard)) < 0) return -1;
-	mdelay(50);
+	/* Phase B (INT handshake) instead of the legacy 2-tx timing path: robust at
+	 * the high RA thread priority (the 2-tx outran the ESP's re-arm and read
+	 * stale → glc m=00 → empty watchlist). The ESP already arms the INT on
+	 * prepare_response for GET_CHUNK, so no ESP change is needed. */
 	memset(ra_chunk_rx, 0, sizeof(ra_chunk_rx));
-	if (ra_xfer(&tx, sizeof(tx), ra_chunk_rx, sizeof(ra_chunk_rx)) < 0) return -1;
+	if (ra_phase_b(&tx, sizeof(tx), ra_chunk_rx, sizeof(ra_chunk_rx)) < 0) return -1;
 
-	memcpy(&resp, ra_chunk_rx, sizeof(resp));
-	memcpy(&chunk, ra_chunk_rx + sizeof(ra_esp_header_t), sizeof(chunk));
-	mdelay(300);   /* let the ESP settle after the big read so the glc log survives */
+	memcpy(&resp,  ra_chunk_rx + PAD, sizeof(resp));
+	memcpy(&chunk, ra_chunk_rx + PAD + sizeof(ra_esp_header_t), sizeof(chunk));
 	{   /* DIAG: what did the chunk read actually return? */
 		char m[64]; u32 o = 0; const char *p = "glc m=";
 		while (*p) m[o++] = *p++;
@@ -455,7 +471,7 @@ static int ra_fetch_watchlist_chunk(u16 chunk_index)
 		p = " ac="; while (*p) m[o++] = *p++;
 		o += ra_appdec(m + o, chunk.addr_count);
 		p = " raw="; while (*p) m[o++] = *p++;
-		{ u16 k; for (k = 0; k < 8; k++) { m[o++] = ra_hexd(ra_chunk_rx[k] >> 4); m[o++] = ra_hexd(ra_chunk_rx[k] & 0xF); } }
+		{ u16 k; for (k = 0; k < 8; k++) { m[o++] = ra_hexd(ra_chunk_rx[PAD+k] >> 4); m[o++] = ra_hexd(ra_chunk_rx[PAD+k] & 0xF); } }
 		m[o] = 0;
 		ra_debug(m);
 	}
@@ -463,7 +479,7 @@ static int ra_fetch_watchlist_chunk(u16 chunk_index)
 	if (chunk.addr_count > RA_WATCHLIST_CHUNK_ADDRS) return -101;
 	if (chunk.chunk_index != chunk_index)            return -102;
 	{
-		const u8 *src = ra_chunk_rx + sizeof(ra_esp_header_t) + sizeof(ra_watchlist_chunk_t);
+		const u8 *src = ra_chunk_rx + PAD + sizeof(ra_esp_header_t) + sizeof(ra_watchlist_chunk_t);
 		for (i = 0; i < chunk.addr_count && ra_watch_count < RA_MAX_WATCH; i++) {
 			u32 a; memcpy(&a, src + i * 4, 4);
 			ra_watchlist[ra_watch_count++] = a;
@@ -649,19 +665,20 @@ static u32 RA_PollThread(void *arg)
 	access_led = false;
 	led_off();
 
-	/* Let the game boot before we start (no VBI game-alive signal yet). With
-	 * RA at priority 0x30 the main loop preempts our EXI bursts, so this only
-	 * needs to cover the apploader/boot window, not the whole session. */
+	/* Let the game boot before we start (no VBI game-alive signal yet). */
 	mdelay(5000);
 
-	/* One IDENTIFY round-trip to prime the ESP response pipeline before the
-	 * GET_CHUNK 2-transaction (the canonical ra-module does this). */
-	(void)ra_identify();
-	mdelay(100);
-
-	/* Pull the watchlist (ESP is GAME_LOADED from the pre-boot handshake). */
+	/* Pull the watchlist (ESP is GAME_LOADED from the pre-boot handshake) via
+	 * Phase B GET_CHUNK. Retry a few times for safety (ra_fetch_watchlist resets
+	 * the count each call, so retries are clean). No IDENTIFY prime needed — the
+	 * legacy 2-tx required it; Phase B's INT handshake does not. */
 	{
-		int wr = ra_fetch_watchlist();
+		int wr = -1, attempt;
+		for (attempt = 0; attempt < 5; attempt++) {
+			wr = ra_fetch_watchlist();
+			if (wr == 0) break;
+			mdelay(100);   /* let the ESP re-arm before retrying */
+		}
 		if (wr == 0) {
 			o = 0;
 			m[o++]='w';m[o++]='l';m[o++]=' ';m[o++]='n';m[o++]='=';
@@ -681,6 +698,10 @@ static u32 RA_PollThread(void *arg)
 			ra_debug(m);
 		}
 	}
+
+	/* (No mid-run priority raise — IOS rejects raising own priority; the thread
+	 * is created at RA_THREAD_PRIO=0x78 and GET_CHUNK is Phase B, so init is safe
+	 * at high priority.) */
 
 	/* SNAPSHOT loop — timer-paced ~30 Hz for now (VBlank sync comes next).
 	 * Drain up to 12 ADDR_QUERY rounds per frame (multi-pass convergence).
@@ -706,6 +727,20 @@ static u32 RA_PollThread(void *arg)
 						ra_debug("GC-RA VBI counter live (true game frames)");
 					}
 				}
+				/* FRAME-ALIGN (Dolphin-like, toggle RA_FRAME_ALIGN): once the VBI
+				 * clock is live, wait for the NEXT frame tick before sampling MEM1
+				 * so every snapshot is a settled frame-boundary state. Costs up to
+				 * ~1 frame/snapshot (big df/s hit + erratic on Melee) — default OFF. */
+#if RA_FRAME_ALIGN
+				if (ra_vbi_live) {
+					u32 t0 = read32(HW_TIMER);
+					while (ra_read_vbi() == vbi) {
+						if ((read32(HW_TIMER) - t0) > RA_FRAME_TICKS * 3u) break;
+						udelay(200);
+					}
+					vbi = ra_read_vbi();
+				}
+#endif
 				ra_game_frame = ra_vbi_live ? (vbi - ra_vbi_base) : hw_frame;
 				ra_vbi_last = vbi;
 			}
@@ -807,9 +842,13 @@ static u32 RA_PollThread(void *arg)
 				ra_debug(m);
 			}
 
-			/* Pace to ~60 Hz real time. If a frame's work overran, re-anchor
-			 * instead of burning through a backlog (the game frame clock above
-			 * already advanced, so the ESP catches up via debt). */
+			/* Pacing. Only when frame-align is ON *and* the VBI clock is live does
+			 * the gate above pace us — skip the timer then. Otherwise (frame-align
+			 * off, or no VBI) use the HW_TIMER pacing (which adds no delay anyway
+			 * once per-snapshot work overruns 60 Hz). */
+#if RA_FRAME_ALIGN
+			if (!ra_vbi_live)
+#endif
 			{
 				u32 now = read32(HW_TIMER);
 				s32 togo = (s32)(next_fire - now);
@@ -1159,7 +1198,7 @@ void RA_Init(void)
 	ra_thread_id = do_thread_create(RA_PollThread,
 	                                (u32 *)&__ra_stack_addr,
 	                                (u32)(&__ra_stack_size),
-	                                0x30);
+	                                RA_THREAD_PRIO);
 	if ((s32)ra_thread_id >= 0)
 		thread_continue(ra_thread_id);
 }
