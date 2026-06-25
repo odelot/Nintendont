@@ -827,6 +827,13 @@ static u32 RA_PollThread(void *arg)
 				o += ra_appdec(m + o, ra_vbi_last);
 				m[o++]=' ';m[o++]='L';m[o++]='v';m[o++]='=';
 				o += ra_appdec(m + o, (u32)ra_vbi_live);
+				/* OVER-COUNT PROBE: pc = codehandler calls via the PADRead path
+				 * (0x1018). Compare Δpc to Δvb (= total, 0x1004) between heartbeats:
+				 * Δpc==Δvb => game polls PADRead Nx/frame; Δvb>Δpc => OSSleepThread
+				 * /PADHook stubs add the rest. */
+				m[o++]=' ';m[o++]='p';m[o++]='c';m[o++]='=';
+				sync_before_read((void*)0x1000, 0x20);
+				o += ra_appdec(m + o, read32(0x1018u));
 #endif
 #if RA_USE_OVERLAY
 				/* Trophy diagnostics: tf = raw VI_TFBL the codehandler reads
