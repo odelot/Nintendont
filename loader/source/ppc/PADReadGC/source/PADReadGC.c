@@ -1600,6 +1600,12 @@ u32 PADRead(u32 calledByGame)
 	//execute codehandler if its there
 	if(*(vu32*)0x800010A0 == 0x9421FF58)
 	{
+		/* DIAG (RA over-count probe): count codehandler invocations that come via
+		 * THIS PADRead path (uncached, so the Starlet can read it at 0xC0001018).
+		 * Compare its rate to the total VBI counter (0x1004): equal => all the
+		 * "frames" are PADReads (game polls Nx/frame); total > this => the
+		 * OSSleepThread/PADHook stubs add the rest. */
+		*(vu32*)0xC0001018 = *(vu32*)0xC0001018 + 1;
 		u32 level = disableIRQs();
 		((void(*)(void))0x800010A0)();
 		restoreIRQs(level);

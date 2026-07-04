@@ -43,16 +43,27 @@ _start:
 	# Touch only r3/r5/r9/r10/r11/r12 here (all saved by stmw above + re-init
 	# by the codehandler before use). Entry LR is at 172(r1); bl clobbers it,
 	# so restore from there before the codehandler's later mflr r29.
-	lis	r12, 0xC000
-	lwz	r3, 0x1004(r12)
-	addi	r3, r3, 1
-	stw	r3, 0x1004(r12)
-
-	# DIAG: publish raw VI_TFBL to 0x1010 EVERY frame so the Starlet can log it.
+	# Read current raw VI_TFBL first — needed for the flip-dedup below AND the
+	# trophy draw later (r3 must still hold it when the trophy block runs).
 	lis	r12, 0xCC00
 	lwz	r3, 0x201C(r12)		# r3 = current raw VI_TFBL
 	lis	r12, 0xC000
 	stw	r3, 0x1010(r12)		# publish (DIAG)
+
+	# Frame counter (0x1004): tick ONLY when the framebuffer flipped vs the last
+	# counted TFBL (0x101C) — i.e. once per REAL video frame. The codehandler is
+	# driven by PADRead + OSSleepThread software hooks, which fire at their own
+	# game-dependent rates (PADRead ~1x/frame, OSSleepThread a variable extra),
+	# so the old unconditional ++ over-counted (Melee 60->90-120, erratic). A
+	# double-buffered 60fps game flips TFBL exactly once/frame → steady 60. r5 scratch.
+	lwz	r5, 0x101C(r12)		# r5 = last counted TFBL
+	cmpw	r3, r5
+	beq	ra_no_tick		# unchanged → same frame → don't tick
+	stw	r3, 0x101C(r12)		# remember this TFBL as last counted
+	lwz	r5, 0x1004(r12)
+	addi	r5, r5, 1
+	stw	r5, 0x1004(r12)
+ra_no_tick:
 
 	# Draw the badge only while the Starlet has the trophy flag set (during the
 	# achievement celebration; the kernel toggles it in sync with the LED → the
