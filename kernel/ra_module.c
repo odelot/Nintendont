@@ -74,8 +74,8 @@ static u32 ra_thread_id = 0;
 static void led_setup(void)
 {
 	set32(HW_GPIO_ENABLE, GPIO_SLOT_LED);
-	clear32(HW_GPIO_DIR, GPIO_SLOT_LED);
-	clear32(HW_GPIO_OWNER, GPIO_SLOT_LED);
+	set32(HW_GPIO_DIR, GPIO_SLOT_LED);     /* DIR=1 => OUTPUT (the bug: was clear=input, so OUT writes didn't drive the pin; diag showed dr=0 + ot toggling + LED stuck on) */
+	clear32(HW_GPIO_OWNER, GPIO_SLOT_LED); /* OWNER=0 => Starlet drives via HW_GPIO_OUT */
 }
 static void led_on(void)  { set32(HW_GPIO_OUT, GPIO_SLOT_LED); }
 static void led_off(void) { clear32(HW_GPIO_OUT, GPIO_SLOT_LED); }
@@ -96,8 +96,12 @@ static void led_blink(int count, int ms)
  * frozen the overlay redraw). On unlock the loop sets ra_celeb = RA_CELEB_FRAMES
  * and counts down, applying each effect per iteration. Each gated by its toggle.
  * ------------------------------------------------------------------------ */
-#define RA_CELEB_FRAMES   120u   /* total celebration length (loop iterations) */
-#define RA_RUMBLE_FRAMES   24u   /* rumble only for the first part (~0.5 s) */
+/* 3 LED blinks to match the Wii d2x ra_led_celebrate (~150 ms on/off). The loop
+ * runs ~50 Hz, so RA_BLINK_HALF=8 iterations ≈ 150 ms per half-pulse; total =
+ * 3 blinks * 2 halves * 8 = 48 iterations. */
+#define RA_BLINK_HALF      8u
+#define RA_CELEB_FRAMES   (3u * 2u * RA_BLINK_HALF)   /* = 48 loop iterations */
+#define RA_RUMBLE_FRAMES   16u   /* (rumble disabled) first part only, if ever re-enabled */
 static u32 ra_celeb = 0;
 
 #if RA_USE_RUMBLE
@@ -413,6 +417,7 @@ static u8 ra_read_mem1(u32 addr)
 /* Append helpers for debug strings. */
 static u32 ra_apphex32(char *d, u32 v) { int i; for (i = 7; i >= 0; i--) d[7 - i] = ra_hexd((v >> (i * 4)) & 0xF); return 8; }
 static u32 ra_appdec(char *d, u32 v)   { char t[10]; u32 n = 0, o = 0; if (!v) { d[0] = '0'; return 1; } while (v) { t[n++] = (char)('0' + v % 10); v /= 10; } while (n) d[o++] = t[--n]; return o; }
+static u32 ra_apphex8(char *d, u32 v) __attribute__((unused));
 static u32 ra_apphex8(char *d, u32 v)  { u32 i; for (i = 0; i < 8; i++) { u32 nib = (v >> ((7 - i) * 4)) & 0xF; d[i] = (char)(nib < 10 ? '0' + nib : 'a' + nib - 10); } return 8; }
 
 /* Fetch one watchlist chunk via the legacy 2-transaction pattern — NOT Phase B
@@ -729,6 +734,13 @@ static u32 RA_PollThread(void *arg)
 			ra_resync_pending = 0;
 #endif
 
+			/* Keep the disc-slot LED exclusively ours: force Nintendont's
+			 * disk-access indicator off so it can't drive the slot LED (it would
+			 * fight our off/blink). The pin is set up as OUTPUT once at thread
+			 * start (led_setup with DIR=1 — the fix for the long-standing
+			 * "LED stuck on" bug; the pin had been left as an input). */
+			access_led = false;
+
 			/* Achievement unlocked — kick off the (non-blocking) celebration. */
 			if (ra_ach_fired) {
 				ra_ach_fired = 0;
@@ -738,10 +750,11 @@ static u32 RA_PollThread(void *arg)
 #endif
 				ra_debug("GC-RA *** ACHIEVEMENT UNLOCKED ***");
 			}
-			/* Drive the celebration a step each loop iteration: LED blink (+
-			 * rumble pulse if enabled). Overlay is flag-gated and drawn PPC-side. */
+			/* Blink while celebrating; otherwise hold the LED dark. */
 			if (ra_celeb > 0) {
-				if ((ra_celeb / 6) & 1) led_on(); else led_off();
+				/* 3 pulses, starting ON (ra_celeb 48..1): on for the first
+				 * RA_BLINK_HALF, off the next, ... → exactly 3 blinks. */
+				if ((ra_celeb / RA_BLINK_HALF) & 1u) led_off(); else led_on();
 #if RA_USE_RUMBLE
 				ra_set_rumble(ra_celeb > RA_CELEB_FRAMES - RA_RUMBLE_FRAMES);
 #endif
@@ -754,6 +767,8 @@ static u32 RA_PollThread(void *arg)
 					ra_set_rumble(0);
 #endif
 				}
+			} else {
+				led_off();   /* normal gameplay: LED off */
 			}
 
 			/* Heartbeat once a second: alive + count + applied seq. */

@@ -67,7 +67,11 @@
  *
  * RA shared slots live in the codehandler's zeroed cheats area (0x1B00 VBI,
  * 0x1B08 overlay flag) — reserved, never touched by the game. */
-#define RA_USE_OVERLAY        1
+/* DISABLED 2026-06-16: overlay still didn't show (white block never appeared) —
+ * turned off so the build is the stable VBI+LED again. To re-enable BOTH this
+ * and RA_OVERLAY_DRAW in PADReadGC.c must be set to 1 (kernel raises the flag /
+ * logs tf=/xf=; PADReadGC does the actual blit + publishes the diag values). */
+#define RA_USE_OVERLAY        0
 #define RA_OVERLAY_FLAG_PHYS  0x1B08u   /* Starlet writes; PADReadGC reads (0xC0001B08) */
 #define RA_USE_RUMBLE         0
 #define RA_RUMBLE_FLAG_PHYS   0x1B10u   /* Starlet writes; PADReadGC reads (0xC0001B10) */
