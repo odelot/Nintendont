@@ -392,12 +392,72 @@ static u8  ra_resync_pending = 0;
 static u16 ra_resync_seq = 0;
 static u8  ra_ach_fired = 0;
 
-static u8 ra_snap_tx[16 + RA_MAX_WATCH + 32] __attribute__((aligned(32)));
-static u8 ra_snap_rx[RA_RESP_LEN]            __attribute__((aligned(32)));
-/* GET_CHUNK response via Phase B: 6(FF pad)+6(esp_hdr)+6(chunk_hdr)+1024*4.
+/* SNAPSHOT tx: 8192 like the canonical d2x ra-module — Phase C snapshots
+ * carry flat values + the chain window (bitmap + blob) + dp sections; the
+ * window budget in ra_send_snapshot is derived from sizeof() this buffer. */
+static u8 ra_snap_tx[8192]        __attribute__((aligned(32)));
+static u8 ra_snap_rx[RA_RESP_LEN] __attribute__((aligned(32)));
+/* GET_CHUNK response via Phase B: 6(FF pad)+6(esp_hdr)+hdr+payload.
+ *   watchlist: 6 + 6 + 6 + 1024×4 = 4114
+ *   chain:     6 + 6 + 8 + 512×8  = 4116  (RA_CHAIN_CHUNK_NODES nodes)
  * The leading 6-byte pad (GC_WRITE_PADDING the ESP prepends) lands at the start
  * of the Phase B read, so the buffer needs the extra 6 vs the old 2-tx path. */
-static u8 ra_chunk_rx[6 + 6 + 6 + RA_WATCHLIST_CHUNK_ADDRS * 4] __attribute__((aligned(32)));
+static u8 ra_chunk_rx[6 + 6 + 8 + RA_WATCHLIST_CHUNK_ADDRS * 4] __attribute__((aligned(32)));
+
+/* ------------------------------------------------------------------------
+ * Phase C chain descriptor table + per-frame walk state (faithful port of
+ * the canonical d2x ra-module). Fetched once per game via
+ * RA_CMD_GET_CHAIN_CHUNK (after the watchlist); node semantics in
+ * gc_ra_protocol.h. node_count==0 => Phase C off (pure legacy).
+ * ------------------------------------------------------------------------ */
+#define RA_CHAIN_PARENT_NONE  0xFFFF
+
+/* Console-side node cap. SMALLER than the protocol's RA_MAX_CHAIN_NODES
+ * (3072, sized for SMG+LB on the Wii): the Nintendont kernel data region
+ * (kernel.ld, 512KB) has only ~69KB of .bss headroom, and 3072-node arrays
+ * cost ~71KB. GC sets are far smaller (Prime-class ≈ hundreds of nodes), so
+ * 2048 (~48KB) fits with margin. Caps may differ per console: a table bigger
+ * than OUR cap is rejected at fetch (-103) -> clean legacy fallback on both
+ * sides (the ESP arms Phase C only when the console fetches the LAST chunk). */
+#define RA_GC_CHAIN_NODES  2048
+
+typedef struct __attribute__((packed)) {
+	u32 operand;   /* const offset/mask/immediate, or root absolute addr */
+	u16 parent;    /* earlier node index, or RA_CHAIN_PARENT_NONE */
+	u8  op;        /* bits 0-4 RA_CN_OP_*, bits 5-6 width-1, bit 7 shipped */
+	u8  psize;     /* RA_CN_SZ_* transform applied to the parent value */
+} ra_chain_node_t;
+
+static ra_chain_node_t ra_chain_nodes[RA_GC_CHAIN_NODES] __attribute__((aligned(32)));
+static u32 ra_chain_values[RA_GC_CHAIN_NODES];         /* LE-pack raw per node */
+static u16 ra_chain_ship_node[RA_GC_CHAIN_NODES];      /* shipped idx -> node idx */
+static u8  ra_chain_node_valid[RA_GC_CHAIN_NODES / 8]; /* bitmap per NODE */
+static u16 ra_chain_node_count = 0;
+static u16 ra_chain_shipped = 0;
+static u16 ra_chain_win_next = 0;                      /* rotating window cursor */
+
+/* Phase D: per-node frame history so dp edges (psize high bits) can read the
+ * parent's PREVIOUS-frame value (rcheevos DELTA) or last-DIFFERENT value
+ * (rcheevos PRIOR). Sound because the ESP's snapshot queue guarantees every
+ * walked frame is evaluated (walks == do_frames), so "previous walk" IS the
+ * evaluator's delta. Updated per node inside the walk (rcheevos update rule);
+ * dp edges are INVALID until the second walk (ra_chain_have_prev). The dp
+ * verification list is the distinct (parent,kind) pairs found scanning the
+ * table in order — the ESP derives the identical list from its own table. */
+static u32 ra_chain_values_prev[RA_GC_CHAIN_NODES];   /* value at previous walk */
+static u32 ra_chain_prior[RA_GC_CHAIN_NODES];         /* last DIFFERENT value */
+static u8  ra_chain_valid_prev[RA_GC_CHAIN_NODES / 8];/* validity at previous walk —
+                                                        * ships as a bitmap after the
+                                                        * dp values so the ESP SKIPS
+                                                        * the compare for parents that
+                                                        * did not resolve (unloaded
+                                                        * pointers; safe: their whole
+                                                        * subtree evaluates as legacy
+                                                        * zeros anyway) */
+static u8  ra_chain_have_prev = 0;
+static u16 ra_chain_dp_node[RA_MAX_DP_PARENTS];        /* dp parent node index */
+static u8  ra_chain_dp_kind[RA_MAX_DP_PARENTS];        /* RA_CN_DP_DELTA/PRIOR */
+static u16 ra_chain_dp_count = 0;
 
 /* Read one byte of GameCube system RAM (MEM1, 24 MB at 0x80000000).
  *
@@ -424,6 +484,134 @@ static u8 ra_read_mem1(u32 addr)
 	 * n=0 (no reads) ran for 16 min. */
 	w = read32(off & ~3u);
 	return (u8)(w >> ((3 - (off & 3)) * 8));
+}
+
+/* ------------------------------------------------------------------------
+ * Phase C — chain walker (faithful port of the canonical d2x ra-module;
+ * mirrors the ESP resolver EXACTLY — see gc_ra_protocol.h for semantics).
+ * Only GC difference: address validation is MEM1-only (24 MB, 0-based);
+ * there is no MEM2 in the GameCube rcheevos memory map. switch() is fine
+ * here (unlike d2x, the Nintendont kernel loads .rodata normally) but the
+ * if/else shape is kept so the two files stay diffable.
+ * ------------------------------------------------------------------------ */
+static u32 ra_chain_xform(u32 v, u8 psize)
+{
+	if (psize == RA_CN_SZ_32)    return v;
+	if (psize == RA_CN_SZ_32_BE) return ((v & 0xFF000000u) >> 24) |
+	                                    ((v & 0x00FF0000u) >>  8) |
+	                                    ((v & 0x0000FF00u) <<  8) |
+	                                    ((v & 0x000000FFu) << 24);
+	if (psize == RA_CN_SZ_8)     return v & 0x000000FFu;
+	if (psize == RA_CN_SZ_16)    return v & 0x0000FFFFu;
+	if (psize == RA_CN_SZ_24)    return v & 0x00FFFFFFu;
+	if (psize == RA_CN_SZ_16_BE) return ((v & 0xFF00u) >> 8) | ((v & 0x00FFu) << 8);
+	if (psize == RA_CN_SZ_24_BE) return ((v & 0xFF0000u) >> 16) | (v & 0x00FF00u) |
+	                                    ((v & 0x0000FFu) << 16);
+	return v;
+}
+
+static u32 ra_chain_combine(u32 pv, u32 o, u8 op)
+{
+	if (op == RA_CN_OP_AND)        return pv & o;
+	if (op == RA_CN_OP_ADD)        return pv + o;
+	if (op == RA_CN_OP_SUB)        return pv - o;
+	if (op == RA_CN_OP_MULT)       return pv * o;
+	if (op == RA_CN_OP_DIV)        return o ? pv / o : 0;
+	if (op == RA_CN_OP_XOR)        return pv ^ o;
+	if (op == RA_CN_OP_MOD)        return o ? pv % o : 0;
+	if (op == RA_CN_OP_SUB_PARENT) return o - pv;
+	if (op == RA_CN_OP_ADD_ACC)    return pv + o;
+	if (op == RA_CN_OP_SUB_ACC)    return pv - o;
+	return 0;
+}
+
+/* GC MEM1 guard (24 MB, 0-based). A wild deref outside the window would
+ * alias through ra_read_mem1's mask (or data-abort on a raw read), so an
+ * out-of-range address makes the node INVALID instead — same policy as the
+ * Wii walker, minus the MEM2 branch (GC games have no MEM2). */
+static int ra_chain_addr_ok(u32 addr, u8 w)
+{
+	u32 end = addr + (u32)w - 1u;
+	if (end < addr) return 0;                                 /* wrap */
+	if (end <= 0x017FFFFFu) return 1;                         /* GC MEM1 */
+	return 0;
+}
+
+/* Walk the whole table in slot order (parents always precede children).
+ * Fills ra_chain_values[] + ra_chain_node_valid[]. Children of an invalid
+ * node are invalid without reading.
+ *
+ * Phase D: an edge whose psize dp-kind != CUR reads the parent's
+ * values_prev (DELTA) or prior (PRIOR) instead of values — the parent was
+ * processed EARLIER this walk, so its values_prev already means "value at
+ * walk N-1". History updates follow the rcheevos rule per node: prev = old,
+ * prior = old only when the value changed. dp edges are invalid until the
+ * second walk (no history yet); an out-of-range address computed from a
+ * garbage prev is caught by the range check like any other. */
+static void ra_chain_walk(void)
+{
+	u16 i;
+
+	/* Snapshot last walk's validity BEFORE overwriting — pairs with the
+	 * values_prev the dp section ships (both describe walk N-1). */
+	memcpy(ra_chain_valid_prev, ra_chain_node_valid, sizeof(ra_chain_valid_prev));
+
+	for (i = 0; i < ra_chain_node_count; i++) {
+		const ra_chain_node_t *n = &ra_chain_nodes[i];
+		u8  op    = n->op & 0x1F;
+		u8  dpk   = (u8)(n->psize >> RA_CN_PSZ_DP_SHIFT);
+		u8  valid = 1;
+		u32 pv    = 0;
+		u32 v     = 0;
+		u32 old;
+
+		if (n->parent != RA_CHAIN_PARENT_NONE) {
+			if (!(ra_chain_node_valid[n->parent >> 3] & (1u << (n->parent & 7))))
+				valid = 0;
+			else if (dpk != RA_CN_DP_CUR && !ra_chain_have_prev)
+				valid = 0;   /* no history yet — dp edge unresolvable */
+			else {
+				u32 praw = (dpk == RA_CN_DP_DELTA) ? ra_chain_values_prev[n->parent]
+				         : (dpk == RA_CN_DP_PRIOR) ? ra_chain_prior[n->parent]
+				         :                           ra_chain_values[n->parent];
+				pv = ra_chain_xform(praw, (u8)(n->psize & RA_CN_PSZ_MEM_MASK));
+			}
+		}
+
+		if (op == RA_CN_OP_NONE) {
+			v = n->operand;
+		}
+		else if (op == RA_CN_OP_DEREF) {
+			u32 addr = (n->parent == RA_CHAIN_PARENT_NONE) ? n->operand
+			                                               : (pv + n->operand);
+			u8 w = (u8)(((n->op >> 5) & 3) + 1);
+			if (valid && ra_chain_addr_ok(addr, w)) {
+				u8 k;
+				for (k = 0; k < w; k++)
+					v |= (u32)ra_read_mem1(addr + k) << (8u * k);
+			} else {
+				valid = 0;
+				v = 0;
+			}
+		}
+		else {
+			if (valid)
+				v = ra_chain_combine(pv, n->operand, op);
+		}
+
+		/* Frame history (Phase D): rcheevos update rule. */
+		old = ra_chain_values[i];
+		ra_chain_values_prev[i] = old;
+		if (v != old)
+			ra_chain_prior[i] = old;
+
+		ra_chain_values[i] = v;
+		if (valid)
+			ra_chain_node_valid[i >> 3] |=  (u8)(1u << (i & 7));
+		else
+			ra_chain_node_valid[i >> 3] &= (u8)~(1u << (i & 7));
+	}
+	ra_chain_have_prev = 1;
 }
 
 /* Append helpers for debug strings. */
@@ -501,6 +689,147 @@ static int ra_fetch_watchlist(void)
 		idx++;
 	}
 	return -200;
+}
+
+/* Fetch one chain-table chunk (Phase C). Same Phase B + PAD=6 pattern as
+ * ra_fetch_watchlist_chunk. *base = nodes accumulated so far. Returns 1 on
+ * is_last, 0 for more, negative on error. */
+static int ra_fetch_chain_chunk(u16 chunk_index, u16 *base)
+{
+	struct __attribute__((packed)) {
+		ra_gc_header_t        hdr;
+		ra_chain_chunk_req_t  req;
+	} tx;
+	ra_esp_header_t   resp;
+	ra_chain_chunk_t  chunk;
+	const u32 PAD = 6;   /* GC_WRITE_PADDING — see ra_fetch_watchlist_chunk */
+	u16 i;
+	int ret;
+
+	tx.hdr.magic       = RA_MAGIC_GC_TO_ESP;
+	tx.hdr.command     = RA_CMD_GET_CHAIN_CHUNK;
+	tx.hdr.payload_len = sizeof(ra_chain_chunk_req_t);
+	tx.req.chunk_index = chunk_index;
+
+	memset(ra_chunk_rx, 0, sizeof(ra_chunk_rx));
+	ret = ra_phase_b(&tx, sizeof(tx), ra_chunk_rx, sizeof(ra_chunk_rx));
+	if (ret < 0) return ret;
+
+	memcpy(&resp, ra_chunk_rx + PAD, sizeof(resp));
+	if (resp.magic != RA_MAGIC_ESP_TO_GC) return -100;
+
+	memcpy(&chunk, ra_chunk_rx + PAD + sizeof(ra_esp_header_t), sizeof(chunk));
+	if (chunk.node_count > RA_CHAIN_CHUNK_NODES)           return -101;
+	if (chunk.chunk_index != chunk_index)                  return -102;
+	if (chunk.total_nodes > RA_GC_CHAIN_NODES)            return -103;
+	if ((u32)*base + chunk.node_count > chunk.total_nodes) return -104;
+
+	memcpy(&ra_chain_nodes[*base],
+	       ra_chunk_rx + PAD + sizeof(ra_esp_header_t) + sizeof(ra_chain_chunk_t),
+	       (u32)chunk.node_count * RA_CHAIN_NODE_SIZE);
+
+	/* Structural validation: parents must reference EARLIER slots (the
+	 * walker is a single forward pass) and ops must be known. A violation
+	 * poisons the whole table -> caller disables Phase C. */
+	for (i = 0; i < chunk.node_count; i++) {
+		const ra_chain_node_t *n = &ra_chain_nodes[*base + i];
+		u8 op = n->op & 0x1F;
+		if (n->parent != RA_CHAIN_PARENT_NONE && n->parent >= (u16)(*base + i))
+			return -105;
+		if (op != RA_CN_OP_NONE && op != RA_CN_OP_DEREF &&
+		    (op < RA_CN_OP_MULT || op > RA_CN_OP_SUB_ACC))
+			return -106;
+	}
+
+	*base = (u16)(*base + chunk.node_count);
+	return chunk.is_last ? 1 : 0;
+}
+
+/* Fetch the whole chain table. Any failure => Phase C off (legacy-only);
+ * an ESP without a table answers node_count=0/is_last=1 on chunk 0. The
+ * ESP arms its Phase-C coverage only when the LAST chunk is fetched, so
+ * an aborted fetch leaves BOTH sides in pure-legacy — never split-brain. */
+static void ra_fetch_chain_table(void)
+{
+	u16 base = 0;
+	u16 chunk_idx = 0;
+	u16 i;
+	int ret;
+	char m[48];
+	u32 o;
+
+	ra_chain_node_count = 0;
+	ra_chain_shipped    = 0;
+	ra_chain_win_next   = 0;
+
+	while (chunk_idx < (RA_GC_CHAIN_NODES / RA_CHAIN_CHUNK_NODES) + 1) {
+		ret = ra_fetch_chain_chunk(chunk_idx, &base);
+		if (ret < 0) {
+			o = 0;
+			const char *p = "GC-RA CHN err=-";
+			while (*p) m[o++] = *p++;
+			o += ra_appdec(m + o, (u32)(-ret));
+			m[o] = 0;
+			ra_debug(m);
+			return;   /* legacy-only */
+		}
+		if (ret == 1) break;
+		chunk_idx++;
+	}
+
+	ra_chain_node_count = base;
+	for (i = 0; i < ra_chain_node_count; i++) {
+		if (ra_chain_nodes[i].op & 0x80)
+			ra_chain_ship_node[ra_chain_shipped++] = i;
+	}
+
+	/* Phase D: reset per-node history + build the dp verification list —
+	 * distinct (parent,kind) pairs in table-scan order (the ESP derives the
+	 * identical list from its copy of the table). Emitter caps the count at
+	 * RA_MAX_DP_PARENTS; overflow here means a corrupt table -> reject. */
+	ra_chain_have_prev = 0;
+	ra_chain_dp_count  = 0;
+	for (i = 0; i < ra_chain_node_count; i++) {
+		ra_chain_values[i]      = 0;
+		ra_chain_values_prev[i] = 0;
+		ra_chain_prior[i]       = 0;
+	}
+	memset(ra_chain_node_valid, 0, sizeof(ra_chain_node_valid));
+	memset(ra_chain_valid_prev, 0, sizeof(ra_chain_valid_prev));
+	for (i = 0; i < ra_chain_node_count; i++) {
+		const ra_chain_node_t *n = &ra_chain_nodes[i];
+		u8 dpk = (u8)(n->psize >> RA_CN_PSZ_DP_SHIFT);
+		u16 j;
+		if (dpk == RA_CN_DP_CUR || n->parent == RA_CHAIN_PARENT_NONE)
+			continue;
+		for (j = 0; j < ra_chain_dp_count; j++)
+			if (ra_chain_dp_node[j] == n->parent && ra_chain_dp_kind[j] == dpk)
+				break;
+		if (j < ra_chain_dp_count)
+			continue;
+		if (ra_chain_dp_count >= RA_MAX_DP_PARENTS) {
+			ra_chain_node_count = 0;   /* corrupt table — Phase C off */
+			ra_chain_shipped    = 0;
+			ra_chain_dp_count   = 0;
+			return;
+		}
+		ra_chain_dp_node[ra_chain_dp_count] = n->parent;
+		ra_chain_dp_kind[ra_chain_dp_count] = dpk;
+		ra_chain_dp_count++;
+	}
+
+	{
+		const char *p = "GC-RA CHN n=";
+		o = 0;
+		while (*p) m[o++] = *p++;
+		o += ra_appdec(m + o, ra_chain_node_count);
+		m[o++]=' ';m[o++]='s';m[o++]='h';m[o++]='=';
+		o += ra_appdec(m + o, ra_chain_shipped);
+		m[o++]=' ';m[o++]='d';m[o++]='p';m[o++]='=';
+		o += ra_appdec(m + o, ra_chain_dp_count);
+		m[o] = 0;
+		ra_debug(m);
+	}
 }
 
 /* Central response parser (Phase D2 — faithful port of the canonical d2x
@@ -586,7 +915,11 @@ static void ra_parse_response(const u8 *buf)
 #define RA_SNAP_TEST_CAP   0    /* 0 = full watchlist (diagnostic isolation off) */
 #define RA_SNAP_TEST_READ  0    /* 0 = full RA_RESP_LEN read */
 
-/* Read all watchlist values from MEM1 and ship a SNAPSHOT. */
+/* Read all watchlist values from MEM1 and ship a SNAPSHOT (v3 header:
+ * flat values + Phase C chain window bitmap/blob + Phase D dp sections —
+ * faithful port of the canonical d2x ra_send_snapshot). With no chain
+ * table (fetch failed / ESP has none) all the v3 sections are empty and
+ * this degrades to the legacy flat snapshot. */
 static int ra_send_snapshot(void)
 {
 	ra_gc_header_t       *hdr  = (ra_gc_header_t *)ra_snap_tx;
@@ -596,21 +929,105 @@ static int ra_send_snapshot(void)
 	u32 tx_len, rx_len;
 	u16 i;
 
+	u16 win_first = 0, win_count = 0;
+	u32 blob_len = 0, bm_bytes = 0;
+
 #if RA_SNAP_TEST_CAP
 	if (count > RA_SNAP_TEST_CAP) count = RA_SNAP_TEST_CAP;
 #endif
 
 	hdr->magic       = RA_MAGIC_GC_TO_ESP;
 	hdr->command     = RA_CMD_SNAPSHOT;
-	hdr->payload_len = sizeof(ra_snapshot_header_t) + count;
 	++ra_frame_counter;                          /* delivery count */
 	snap->frame_counter = ra_game_frame;         /* real-time 60 Hz frame clock */
 	snap->addr_count    = count;
 	snap->wl_seq        = ra_wl_seq;             /* Phase D2 sync echo */
 	for (i = 0; i < count; i++)
 		vals[i] = ra_read_mem1(ra_watchlist[i]);
+	if (ra_chain_node_count > 0)
+		ra_chain_walk();
 
-	tx_len = sizeof(ra_gc_header_t) + sizeof(ra_snapshot_header_t) + count;
+	/* Phase C chain window — greedy fill from the rotating cursor until the
+	 * 8192B transaction budget is hit; next frame resumes where we stopped
+	 * (wraps to 0 at the end). Bitmap bit i = window slot i valid.
+	 * Phase D: the dp verification section (4B per dp entry) is reserved
+	 * OFF THE TOP so the window can never squeeze it out. */
+	if (ra_chain_node_count > 0 && ra_chain_shipped > 0) {
+		u32 avail = sizeof(ra_snap_tx) - sizeof(ra_gc_header_t)
+		          - sizeof(ra_snapshot_header_t) - count
+		          - (u32)ra_chain_dp_count * 4u
+		          - ((u32)ra_chain_dp_count + 7u) / 8u;  /* dp validity bitmap */
+		u16 s = (ra_chain_win_next < ra_chain_shipped) ? ra_chain_win_next : 0;
+
+		win_first = s;
+		while (s < ra_chain_shipped) {
+			const ra_chain_node_t *n = &ra_chain_nodes[ra_chain_ship_node[s]];
+			u8  w  = (u8)(((n->op >> 5) & 3) + 1);
+			u32 nb = (((u32)win_count + 1u) + 7u) / 8u;
+			if (nb + blob_len + w > avail) break;
+			blob_len += w;
+			win_count++;
+			s++;
+		}
+		bm_bytes = ((u32)win_count + 7u) / 8u;
+		ra_chain_win_next = (s >= ra_chain_shipped) ? 0 : s;
+
+		{
+			u8 *bm   = vals + count;
+			u8 *blob = bm + bm_bytes;
+			u16 wi;
+			for (wi = 0; wi < bm_bytes; wi++)
+				bm[wi] = 0;
+			for (wi = 0; wi < win_count; wi++) {
+				u16 node = ra_chain_ship_node[win_first + wi];
+				const ra_chain_node_t *n = &ra_chain_nodes[node];
+				u8  w = (u8)(((n->op >> 5) & 3) + 1);
+				u32 v = ra_chain_values[node];
+				u8  k;
+				if (ra_chain_node_valid[node >> 3] & (1u << (node & 7)))
+					bm[wi >> 3] |= (u8)(1u << (wi & 7));
+				for (k = 0; k < w; k++)
+					blob[k] = (u8)(v >> (8u * k));
+				blob += w;
+			}
+		}
+	}
+	snap->chain_first    = win_first;
+	snap->chain_count    = win_count;
+	snap->chain_blob_len = (u16)blob_len;
+	snap->dp_count       = ra_chain_dp_count;
+
+	/* Phase D dp verification section — the prev/prior parent values the
+	 * walker used THIS frame (list order fixed at fetch; the ESP compares
+	 * against its own memref delta/prior after its upd and defers on
+	 * mismatch). Written after the window blob. */
+	if (ra_chain_dp_count > 0) {
+		u8 *dp = vals + count + bm_bytes + blob_len;
+		u8 *dpv = dp + (u32)ra_chain_dp_count * 4u;   /* validity bitmap */
+		u32 dpv_bytes = ((u32)ra_chain_dp_count + 7u) / 8u;
+		u16 di;
+		for (di = 0; di < dpv_bytes; di++)
+			dpv[di] = 0;
+		for (di = 0; di < ra_chain_dp_count; di++) {
+			u16 node = ra_chain_dp_node[di];
+			u32 dv = (ra_chain_dp_kind[di] == RA_CN_DP_PRIOR)
+			         ? ra_chain_prior[node]
+			         : ra_chain_values_prev[node];
+			memcpy(dp + (u32)di * 4u, &dv, 4);   /* Starlet is BE = wire order */
+			/* validity of the shipped value = the parent RESOLVED at walk
+			 * N-1 (values_prev meaningful). ESP skips the compare on 0. */
+			if (ra_chain_valid_prev[node >> 3] & (1u << (node & 7)))
+				dpv[di >> 3] |= (u8)(1u << (di & 7));
+		}
+	}
+
+	hdr->payload_len = (u16)(sizeof(ra_snapshot_header_t) + count
+	                         + bm_bytes + blob_len
+	                         + (u32)ra_chain_dp_count * 4u
+	                         + ((u32)ra_chain_dp_count + 7u) / 8u);
+	tx_len = sizeof(ra_gc_header_t) + sizeof(ra_snapshot_header_t) + count
+	       + bm_bytes + blob_len + (u32)ra_chain_dp_count * 4u
+	       + ((u32)ra_chain_dp_count + 7u) / 8u;
 	rx_len = RA_SNAP_TEST_READ ? RA_SNAP_TEST_READ : RA_RESP_LEN;
 	memset(ra_snap_rx, 0, sizeof(ra_snap_rx));
 	if (ra_phase_b(ra_snap_tx, tx_len, ra_snap_rx, rx_len) < 0) return -1;
@@ -689,6 +1106,11 @@ static u32 RA_PollThread(void *arg)
 			}
 			m[o] = 0;
 			ra_debug(m);
+			/* Phase C: fetch the chain descriptor table (once per game).
+			 * Failure => ra_chain_node_count stays 0 => pure legacy, and
+			 * the ESP (which arms coverage only on the LAST chunk) stays
+			 * legacy too — never split-brain. */
+			ra_fetch_chain_table();
 		} else {
 			o = 0;
 			m[o++]='w';m[o++]='l';m[o++]=' ';m[o++]='F';m[o++]='A';m[o++]='I';m[o++]='L';m[o++]=' ';
@@ -820,6 +1242,9 @@ static u32 RA_PollThread(void *arg)
 				o += ra_appdec(m + o, ra_wl_seq);
 				m[o++]=' ';m[o++]='g';m[o++]='f';m[o++]='=';
 				o += ra_appdec(m + o, ra_game_frame);
+				/* Phase C visibility: shipped chain slots (0 = legacy). */
+				m[o++]=' ';m[o++]='c';m[o++]='h';m[o++]='=';
+				o += ra_appdec(m + o, ra_chain_shipped);
 #if RA_USE_VBI
 				/* VBI diagnostics: raw PPC counter + live flag. When live, gf
 				 * tracks vb-base; compare vb's rate to gf to confirm ~60 Hz. */
