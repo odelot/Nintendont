@@ -49,6 +49,23 @@
 #define RA_USE_VBI            1
 #define RA_VBI_COUNTER_PHYS   0x1004u
 
+/* Frame-aligned snapshot (default OFF). When ON, the loop waits for the next
+ * VBI tick before sampling MEM1 so each snapshot is a settled frame-boundary
+ * state (Dolphin-like, fixes inconsistent pointer-chain reads). BUT it adds up
+ * to ~1 frame (~16 ms) of wait per snapshot, which dropped df/s hard and went
+ * erratic (Melee 30→~17, gf/s went 59→97). Kept behind a toggle to A/B test:
+ * 0 = async sampling (high df/s, the proven-stable behavior); 1 = frame-aligned. */
+#define RA_FRAME_ALIGN        0
+
+/* RA background-thread priority (2026-06-23): created at 0x78 (= main/DI/HID/BT/SO
+ * tier) so the snapshot loop isn't preempted during its active EXI work — this
+ * ~doubled df/s on preemption-limited games (Melee 20→60). IOS only lets a
+ * thread LOWER its own priority (a mid-run raise from 0x30 returned -4), so we
+ * must CREATE high. The only transaction that raced at high priority was the
+ * legacy 2-tx GET_CHUNK; it's now Phase B (INT handshake, robust at any prio),
+ * so high-from-creation is safe. Lower this if a game stutters (RA starving DI). */
+#define RA_THREAD_PRIO        0x78
+
 /* ------------------------------------------------------------------------
  * Achievement TROPHY OVERLAY (feature toggle, default ON). v3 (2026-06-22):
  * ported from the WORKING WiiFlow ra_trophy_hook.s. The BADGE is drawn on the
