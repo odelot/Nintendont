@@ -52,7 +52,15 @@ extern bool access_led;
 #define RA_HW_EXICTRL      0x0d800070
 #define RA_EXICTRL_ENABLE  1
 
-/* ESP32 in Slot B, CS0, 8 MHz — identical to the Wii. */
+/* ESP32 in Slot B (EXI chan 1), CS0 — same channel as the Wii stack.
+ * FREQ: 8 MHz for EVERYTHING here (pre-boot handshake AND snapshots). The
+ * Wii differs in-game: WiiFlow's pre-boot phase is 8 MHz but the d2x
+ * ra-module runs snapshots at 16 MHz (EXI_SPEED16MHZ; 32 MHz corrupts —
+ * wiring ceiling, HW-tested 2026-06-30). The EXI clock is per-transaction
+ * (set in CSR at every select; the ESP is an SPI slave and just samples
+ * whatever clock arrives), so bumping this to 0x40 (16 MHz) for the
+ * snapshot phase is a proven-safe future win on the same Wii wiring —
+ * untested on a real GameCube slot, so it stays 8 MHz for now. */
 #define RA_CHAN            1
 #define RA_DEV             0
 #define RA_FREQ            0x30   /* EXI_SPEED8MHZ (CPR bits 4..6) */
