@@ -32,17 +32,76 @@ _start:
 
 	stmw	r3,24(r1)		# saves r3-r31
 
-	# --- RetroAchievements: per-frame VBlank counter ---------------------
-	# This _start runs once per game frame (hooked at OSSleepThread/PADHook).
-	# Bump a u32 at MEM1 0x1B00 via an UNCACHED store (0xC0001B00) so the
-	# Starlet (ra_module) sees every increment without cache coherency games.
-	# 0x1B00 lives in the zeroed cheats area reserved by the codehandler load,
-	# just above the codehandler code+codelist. (0x2FF8 — the Wii's choice —
-	# is ABOVE POffset on GameCube, hence the earlier garbage base value.)
-	lis	r3, 0xC000
-	lwz	r4, 0x1B00(r3)
-	addi	r4, r4, 1
-	stw	r4, 0x1B00(r3)
+	# --- RetroAchievements: VBI frame counter + TROPHY BADGE overlay -----
+	# Runs once per game frame. Mirrors the WORKING WiiFlow ra_trophy_hook.s.
+	# Shared slots live in the codehandler's cheatdata scratch (FIXED at the
+	# start of the blob, so code growth doesn't move them; zeroed, unused when
+	# no GCT is loaded — RA overrides cheats):
+	#   0xC0001004 : u32 VBI frame counter (Starlet polls it)
+	#   0xC0001008 : u32 trophy flag (Starlet sets !=0 to draw this frame)
+	#   0xC000100C : scratch, previous frame's raw VI_TFBL (double-buffer)
+	# Touch only r3/r5/r9/r10/r11/r12 here (all saved by stmw above + re-init
+	# by the codehandler before use). Entry LR is at 172(r1); bl clobbers it,
+	# so restore from there before the codehandler's later mflr r29.
+	lis	r12, 0xC000
+	lwz	r3, 0x1004(r12)
+	addi	r3, r3, 1
+	stw	r3, 0x1004(r12)
+
+	# DIAG: publish raw VI_TFBL to 0x1010 EVERY frame so the Starlet can log it.
+	lis	r12, 0xCC00
+	lwz	r3, 0x201C(r12)		# r3 = current raw VI_TFBL
+	lis	r12, 0xC000
+	stw	r3, 0x1010(r12)		# publish (DIAG)
+
+	# Draw the badge only while the Starlet has the trophy flag set (during the
+	# achievement celebration; the kernel toggles it in sync with the LED → the
+	# badge blinks 3x on unlock, like the WiiFlow trophy).
+	lwz	r9, 0x1008(r12)		# trophy flag
+	cmpwi	r9, 0
+	beq	ra_ovl_done
+	cmpwi	r3, 0			# r3 still = raw VI_TFBL
+	beq	ra_ovl_done
+
+	# DIAG: badge-exec counter at 0x1014 (proves flag seen + TFBL valid + drew).
+	lwz	r5, 0x1014(r12)
+	addi	r5, r5, 1
+	stw	r5, 0x1014(r12)
+
+	lwz	r9, 0x100C(r12)		# r9 = previous frame's raw VI_TFBL
+	stw	r3, 0x100C(r12)		# save current as new previous
+
+	# ---- current buffer ---- POFF-aware decode (GameCube: POFF clear = the
+	# address is stored DIRECTLY, no <<5; Wii had POFF set = FBB<<5).
+	andis.	r5, r3, 0x1000		# test POFF (bit 28 = 0x10000000)
+	rlwinm	r3, r3, 0, 8, 31	# FBB = raw & 0x00FFFFFF
+	beq	ra_csh			# POFF clear → direct physical XFB
+	slwi	r3, r3, 5		# POFF set → FBB << 5
+ra_csh:
+	oris	r3, r3, 0xC000		# | 0xC0000000 (uncached)
+	lis	r12, 0x0000
+	ori	r12, r12, 0x7850	# badge top-left = row24*1280 + col20(u32)*4
+	add	r12, r3, r12
+	bl	ra_draw_badge
+
+	# ---- previous buffer (skip if 0) ----
+	cmpwi	r9, 0
+	beq	ra_ovl_lr
+	andis.	r5, r9, 0x1000		# POFF on the previous raw VI_TFBL
+	rlwinm	r3, r9, 0, 8, 31
+	beq	ra_psh
+	slwi	r3, r3, 5
+ra_psh:
+	oris	r3, r3, 0xC000
+	lis	r12, 0x0000
+	ori	r12, r12, 0x7850
+	add	r12, r3, r12
+	bl	ra_draw_badge
+
+ra_ovl_lr:
+	lwz	r3, 172(r1)		# restore entry LR (bl clobbered it)
+	mtlr	r3
+ra_ovl_done:
 	# ---------------------------------------------------------------------
 
 	mfmsr	r20
@@ -972,7 +1031,140 @@ _load_baseaddress:
 	b	_readcodes
 
 #===============================================================================
-       
+# RetroAchievements trophy badge (ported verbatim from the working WiiFlow
+# ra_trophy_hook.s). r12 = badge top-left uncached base. Clobbers r3,r5,r10,r11.
+# Preserves r9. Leaf (ends with blr). 32x32 YUYV badge: black border, white
+# interior, gold trophy. Stride 1280 (640px). Reached via bl from _start.
+ra_draw_badge:
+    # ===================== BLACK outline =====================
+    lis    11, 0x0080
+    ori    11, 11, 0x0080       # COLOR_BLACK 0x00800080
+    # B1: rows0-1, c1-14 (14), off 0x4
+    addi   5, 12, 0x4
+    li     10, 2
+ra_bb1:
+    stw 11,0(5); stw 11,4(5); stw 11,8(5); stw 11,12(5); stw 11,16(5)
+    stw 11,20(5); stw 11,24(5); stw 11,28(5); stw 11,32(5); stw 11,36(5)
+    stw 11,40(5); stw 11,44(5); stw 11,48(5); stw 11,52(5)
+    addi 5,5,1280
+    subic. 10,10,1
+    bne ra_bb1
+    # B2: rows2-29, c0-15 (16), off 0xA00
+    addi   5, 12, 0xA00
+    li     10, 28
+ra_bb2:
+    stw 11,0(5); stw 11,4(5); stw 11,8(5); stw 11,12(5); stw 11,16(5)
+    stw 11,20(5); stw 11,24(5); stw 11,28(5); stw 11,32(5); stw 11,36(5)
+    stw 11,40(5); stw 11,44(5); stw 11,48(5); stw 11,52(5); stw 11,56(5)
+    stw 11,60(5)
+    addi 5,5,1280
+    subic. 10,10,1
+    bne ra_bb2
+    # B3: rows30-31, c1-14 (14), off 0x9604 (>0x8000 -> addis+addi)
+    addis  5, 12, 1
+    addi   5, 5, -0x69FC
+    li     10, 2
+ra_bb3:
+    stw 11,0(5); stw 11,4(5); stw 11,8(5); stw 11,12(5); stw 11,16(5)
+    stw 11,20(5); stw 11,24(5); stw 11,28(5); stw 11,32(5); stw 11,36(5)
+    stw 11,40(5); stw 11,44(5); stw 11,48(5); stw 11,52(5)
+    addi 5,5,1280
+    subic. 10,10,1
+    bne ra_bb3
+
+    # ===================== WHITE interior =====================
+    lis    11, 0xFF80
+    ori    11, 11, 0xFF80       # COLOR_WHITE 0xFF80FF80
+    # W1: rows2-3, c2-13 (12), off 0xA08
+    addi   5, 12, 0xA08
+    li     10, 2
+ra_bw1:
+    stw 11,0(5); stw 11,4(5); stw 11,8(5); stw 11,12(5); stw 11,16(5)
+    stw 11,20(5); stw 11,24(5); stw 11,28(5); stw 11,32(5); stw 11,36(5)
+    stw 11,40(5); stw 11,44(5)
+    addi 5,5,1280
+    subic. 10,10,1
+    bne ra_bw1
+    # W2: rows4-27, c1-14 (14), off 0x1404
+    addi   5, 12, 0x1404
+    li     10, 24
+ra_bw2:
+    stw 11,0(5); stw 11,4(5); stw 11,8(5); stw 11,12(5); stw 11,16(5)
+    stw 11,20(5); stw 11,24(5); stw 11,28(5); stw 11,32(5); stw 11,36(5)
+    stw 11,40(5); stw 11,44(5); stw 11,48(5); stw 11,52(5)
+    addi 5,5,1280
+    subic. 10,10,1
+    bne ra_bw2
+    # W3: rows28-29, c2-13 (12), off 0x8C08 (>0x8000 -> addis+addi)
+    addis  5, 12, 1
+    addi   5, 5, -0x73F8
+    li     10, 2
+ra_bw3:
+    stw 11,0(5); stw 11,4(5); stw 11,8(5); stw 11,12(5); stw 11,16(5)
+    stw 11,20(5); stw 11,24(5); stw 11,28(5); stw 11,32(5); stw 11,36(5)
+    stw 11,40(5); stw 11,44(5)
+    addi 5,5,1280
+    subic. 10,10,1
+    bne ra_bw3
+
+    # ===================== GOLD trophy =====================
+    lis    11, 0x972B
+    ori    11, 11, 0x97A6       # YUYV deep gold (RGB ~204,153,0)
+    # rim: rows5-7, c3-12 (10), off 0x190C
+    addi   5, 12, 0x190C
+    li     10, 3
+ra_bt1:
+    stw 11,0(5); stw 11,4(5); stw 11,8(5); stw 11,12(5); stw 11,16(5)
+    stw 11,20(5); stw 11,24(5); stw 11,28(5); stw 11,32(5); stw 11,36(5)
+    addi 5,5,1280
+    subic. 10,10,1
+    bne ra_bt1
+    # bowl: rows8-14, c4-11 (8), off 0x2810
+    addi   5, 12, 0x2810
+    li     10, 7
+ra_bt2:
+    stw 11,0(5); stw 11,4(5); stw 11,8(5); stw 11,12(5); stw 11,16(5)
+    stw 11,20(5); stw 11,24(5); stw 11,28(5)
+    addi 5,5,1280
+    subic. 10,10,1
+    bne ra_bt2
+    # taper: rows15-16, c6-9 (4), off 0x4B18
+    addi   5, 12, 0x4B18
+    li     10, 2
+ra_bt3:
+    stw 11,0(5); stw 11,4(5); stw 11,8(5); stw 11,12(5)
+    addi 5,5,1280
+    subic. 10,10,1
+    bne ra_bt3
+    # stem: rows17-21, c7-8 (2), off 0x551C
+    addi   5, 12, 0x551C
+    li     10, 5
+ra_bt4:
+    stw 11,0(5); stw 11,4(5)
+    addi 5,5,1280
+    subic. 10,10,1
+    bne ra_bt4
+    # plate: rows22-23, c6-9 (4), off 0x6E18
+    addi   5, 12, 0x6E18
+    li     10, 2
+ra_bt5:
+    stw 11,0(5); stw 11,4(5); stw 11,8(5); stw 11,12(5)
+    addi 5,5,1280
+    subic. 10,10,1
+    bne ra_bt5
+    # foot: rows24-26, c4-11 (8), off 0x7810
+    addi   5, 12, 0x7810
+    li     10, 3
+ra_bt6:
+    stw 11,0(5); stw 11,4(5); stw 11,8(5); stw 11,12(5); stw 11,16(5)
+    stw 11,20(5); stw 11,24(5); stw 11,28(5)
+    addi 5,5,1280
+    subic. 10,10,1
+    bne ra_bt6
+    blr
+
+#===============================================================================
+
 frozenvalue:	#frozen value, then LR
 .long        0,0
 dwordbuffer:
