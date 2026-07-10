@@ -1372,6 +1372,55 @@ int main(int argc, char **argv)
 				PrintFormat(DEFAULT_SIZE, BLACK, MENU_POS_X, MENU_POS_Y + 20*15, "Init CARD...");
 			if(abs(STATUS_LOADING) > 10 && abs(STATUS_LOADING) < 20)
 				PrintFormat(DEFAULT_SIZE, BLACK, MENU_POS_X, MENU_POS_Y + 20*15, "Init CARD... Done!");
+
+			/* RetroAchievements pre-boot handshake (kernel stages 12-16,
+			 * only when the RetroAchievements setting is On). One line that
+			 * updates in place; negative = fatal, kernel shuts down after
+			 * a few seconds — the message explains exactly what failed. */
+			if(STATUS_LOADING == 12)
+				PrintFormat(DEFAULT_SIZE, BLACK, MENU_POS_X, MENU_POS_Y + 20*16, "RA: detecting adapter... %35s", " ");
+			if(STATUS_LOADING == 13)
+				PrintFormat(DEFAULT_SIZE, BLACK, MENU_POS_X, MENU_POS_Y + 20*16, "RA: waiting for adapter (WiFi/login)... %20s", " ");
+			if(STATUS_LOADING == 14)
+				PrintFormat(DEFAULT_SIZE, BLACK, MENU_POS_X, MENU_POS_Y + 20*16, "RA: computing game hash... %33s", " ");
+			if(STATUS_LOADING == 15)
+				PrintFormat(DEFAULT_SIZE, BLACK, MENU_POS_X, MENU_POS_Y + 20*16, "RA: downloading achievement data... %24s", " ");
+			if(STATUS_LOADING == 16)
+				PrintFormat(DEFAULT_SIZE, BLACK, MENU_POS_X, MENU_POS_Y + 20*16, "RA: achievements ready! %36s", " ");
+			if(STATUS_LOADING == -12)
+				PrintFormat(DEFAULT_SIZE, MAROON, MENU_POS_X, MENU_POS_Y + 20*16, "RA: adapter not detected in Slot B! Shutting down");
+			if(STATUS_LOADING == -13)
+			{
+				if(STATUS_ERROR == 0x08)
+					PrintFormat(DEFAULT_SIZE, MAROON, MENU_POS_X, MENU_POS_Y + 20*16, "RA: adapter unconfigured! Use the WII_RA_ADAPTER WiFi portal");
+				else if(STATUS_ERROR <= 0x02)
+					PrintFormat(DEFAULT_SIZE, MAROON, MENU_POS_X, MENU_POS_Y + 20*16, "RA: adapter can't join WiFi! Shutting down");
+				else
+					PrintFormat(DEFAULT_SIZE, MAROON, MENU_POS_X, MENU_POS_Y + 20*16, "RA: adapter not ready (status %d)! Shutting down", STATUS_ERROR);
+			}
+			if(STATUS_LOADING == -14)
+				PrintFormat(DEFAULT_SIZE, MAROON, MENU_POS_X, MENU_POS_Y + 20*16, "RA: can't read/hash the game image (err %d)! Shutting down", STATUS_ERROR);
+			if(STATUS_LOADING == -15)
+			{
+				switch(STATUS_ERROR)
+				{
+					case 0xE0:
+						PrintFormat(DEFAULT_SIZE, MAROON, MENU_POS_X, MENU_POS_Y + 20*16, "RA: adapter has no internet! Shutting down");
+						break;
+					case 0xE1:
+						PrintFormat(DEFAULT_SIZE, MAROON, MENU_POS_X, MENU_POS_Y + 20*16, "RA: login rejected! Reconfigure the adapter credentials");
+						break;
+					case 0xE4:
+						PrintFormat(DEFAULT_SIZE, MAROON, MENU_POS_X, MENU_POS_Y + 20*16, "RA: hash not in the RA database - bad dump? Shutting down");
+						break;
+					case 1:
+						PrintFormat(DEFAULT_SIZE, MAROON, MENU_POS_X, MENU_POS_Y + 20*16, "RA: timed out downloading achievements! Shutting down");
+						break;
+					default:
+						PrintFormat(DEFAULT_SIZE, MAROON, MENU_POS_X, MENU_POS_Y + 20*16, "RA: achievement load failed (err %d)! Shutting down", STATUS_ERROR);
+						break;
+				}
+			}
 			GRRLIB_Screen2Texture(0, 0, screen_buffer, GX_FALSE); // Copy all status messages
 			GRRLIB_Render();
 			ClearScreen();

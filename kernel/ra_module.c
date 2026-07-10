@@ -1456,13 +1456,68 @@ static int ra_compute_gc_hash(char out_hex[33])
 }
 
 /* ------------------------------------------------------------------------
+ * One POLL round-trip. Returns 0 and fills *status on a coherent response,
+ * -1 on EXI failure / bad magic (half-duplex idle FF — caller keeps polling).
+ * ------------------------------------------------------------------------ */
+static int ra_poll_status(u8 *status)
+{
+	ra_gc_header_t poll;
+	u8 rx[sizeof(ra_esp_header_t)];
+	const ra_esp_header_t *r;
+
+	poll.magic       = RA_MAGIC_GC_TO_ESP;
+	poll.command     = RA_CMD_POLL;
+	poll.payload_len = 0;
+	memset(rx, 0, sizeof(rx));
+	if (ra_xfer(&poll, sizeof(poll), rx, sizeof(rx)) != 0)
+		return -1;
+	r = (const ra_esp_header_t *)rx;
+	if (r->magic != RA_MAGIC_ESP_TO_GC)
+		return -1;
+	*status = r->status;
+	return 0;
+}
+
+/* ------------------------------------------------------------------------
+ * Wait until the adapter is READY for LOAD_GAME (status >= LOGGED_IN). Right
+ * after power-on the ESP may still be joining WiFi or logging in (0x00-0x03)
+ * — fw v0.35.0+ answers EXI during that window and exposes the progress.
+ * Old error states (0xE0+) also count as ready: sending LOAD_GAME is exactly
+ * how a new attempt resets them. The config portal never resolves by
+ * waiting, so it fails immediately.
+ *
+ * Returns 0 = ready, 1 = portal (not configured), -1 = timeout.
+ * *last_status = last status seen (for the caller's error report).
+ * ------------------------------------------------------------------------ */
+#define RA_READY_POLLS       200   /* × 300 ms ≈ 60 s (router boot headroom) */
+
+static int ra_wait_ready(u8 *last_status)
+{
+	int attempt;
+	*last_status = 0;
+	for (attempt = 0; attempt < RA_READY_POLLS; attempt++) {
+		u8 st;
+		if (ra_poll_status(&st) == 0) {
+			*last_status = st;
+			if (st == RA_STATUS_PORTAL)
+				return 1;
+			if (st >= RA_STATUS_LOGGED_IN)
+				return 0;
+		}
+		mdelay(300);
+	}
+	return -1;
+}
+
+/* ------------------------------------------------------------------------
  * LOAD_GAME + poll for GAME_LOADED. Mirrors WiiFlow ra_exi.c: the response in
  * the same (half-duplex) transaction is unreliable, so we send LOAD_GAME and
  * then poll RA_CMD_POLL until the ESP reports GAME_LOADED/ACTIVE (it fetches
  * the achievement set from the RA server, which can take a while). The ESP
  * prints its own progress on Serial; we just wait for the terminal status.
  *
- * Returns 0 on GAME_LOADED/ACTIVE, -2 on ESP error status, -1 on timeout.
+ * Returns 0 on GAME_LOADED/ACTIVE, the ESP status byte (>0, 0xE0.. or
+ * RA_STATUS_PORTAL) on ESP-reported failure, -1 on timeout.
  * ------------------------------------------------------------------------ */
 #define RA_LOADGAME_POLLS    300   /* × 300 ms ≈ 90 s */
 #define RA_LOADGAME_POLL_MS  300
@@ -1497,47 +1552,54 @@ static int ra_load_game(const char *game_id6, const char *md5_hex)
 
 	/* Poll until terminal status. */
 	for (attempt = 0; attempt < RA_LOADGAME_POLLS; attempt++) {
-		ra_gc_header_t poll;
-		const ra_esp_header_t *r;
+		u8 st;
 
 		mdelay(RA_LOADGAME_POLL_MS);
 
-		poll.magic       = RA_MAGIC_GC_TO_ESP;
-		poll.command     = RA_CMD_POLL;
-		poll.payload_len = 0;
-		memset(rx, 0, sizeof(rx));
-		if (ra_xfer(&poll, sizeof(poll), rx, sizeof(rx)) != 0)
-			continue;
-
-		r = (const ra_esp_header_t *)rx;
-		if (r->magic != RA_MAGIC_ESP_TO_GC)
+		if (ra_poll_status(&st) != 0)
 			continue;                       /* half-duplex idle FF — keep polling */
-		if (r->status == RA_STATUS_GAME_LOADED || r->status == RA_STATUS_ACTIVE)
+		if (st == RA_STATUS_GAME_LOADED || st == RA_STATUS_ACTIVE)
 			return 0;
-		if (r->status >= RA_STATUS_ERROR_WIFI)
-			return -2;
+		if (st == RA_STATUS_PORTAL || RA_STATUS_IS_ERROR(st))
+			return (int)st;
 	}
 	return -1;
 }
 
 /* ------------------------------------------------------------------------
- * Phase 2a — synchronous pre-boot handshake.
+ * Fatal pre-boot RA failure: report the stage (-12..-15) + detail code to
+ * the PPC loader (it prints the specific message in MAROON), give the user
+ * time to read it, then shut down — the same pattern Nintendont uses for
+ * its own fatal boot errors (storage/FS init). The RetroAchievements
+ * setting is On, so a silent no-achievements boot would defeat the point.
+ * ------------------------------------------------------------------------ */
+static void NORETURN ra_fatal(s32 stage, s32 detail)
+{
+	BootStatusError(stage, detail);
+	mdelay(8000);   /* let the user read the loader message */
+	Shutdown();
+}
+
+/* ------------------------------------------------------------------------
+ * Phase 2a/2b — synchronous pre-boot handshake (only when the loader's
+ * RetroAchievements setting is On).
  *
  * Called from main() right before the kernel tells the PPC loader it is
  * ready (BootStatus(0xdeadbeef)). While we block here, the loader sits in
- * its "Loading patched kernel..." wait loop and the GameCube game has NOT
- * started — exactly the window we want for game identification + achievement
- * fetch.
+ * its boot-status screen and the GameCube game has NOT started — exactly
+ * the window for game identification + achievement fetch, and the loader
+ * displays each stage via BootStatus 12-16:
  *
- * For now this only validates the gating: a few IDENTIFY round-trips to
- * confirm the EXI link works at this pre-boot point, then a deliberate
- * multi-second delay simulating the ESP's RA-server fetch. On hardware we
- * expect the game boot to be visibly delayed by this block, with the
- * PRE-BOOT debug lines appearing on the ESP's COM4 BEFORE the game runs.
+ *   12  probe adapter (fail fast — no 90 s wait when it's unplugged)
+ *   13  wait for adapter ready (its WiFi join / RA login after power-on)
+ *   14  read the game image + compute the RA GameCube MD5
+ *   15  LOAD_GAME -> ESP downloads the achievement set
+ *   16  done — achievements ready, game boot proceeds
  *
- * Phase 2b will replace the simulated delay with: read disc header + DOL via
- * ReadRealDisc/ISORead, compute the RetroAchievements GameCube MD5, send
- * RA_CMD_LOAD_GAME (has_hash=1), and poll RA_CMD_POLL until GAME_LOADED.
+ * Any failure calls ra_fatal(-stage, detail): the loader shows WHY (no
+ * adapter / portal / no internet / login rejected / unknown hash = bad
+ * dump / timeout) and the console shuts down instead of silently playing
+ * without achievements.
  * ------------------------------------------------------------------------ */
 void RA_PreBootHandshake(void)
 {
@@ -1548,16 +1610,44 @@ void RA_PreBootHandshake(void)
 	led_setup();
 	led_blink(3, 80);   /* entering pre-boot handshake */
 
+	/* ---- Stage 12: adapter presence (fail fast) ---- */
+	BootStatus(12, 0, 0);
+	{
+		int found = 0;
+		for (i = 0; i < 5; i++) {
+			if (ra_identify() == 0) { found = 1; break; }
+			mdelay(50);
+		}
+		if (!found) {
+			ra_debug("GC-RA PRE-BOOT: adapter not detected");
+			ra_fatal(-12, 0);
+		}
+	}
+
+	/* ---- Stage 13: wait until the adapter is ready for LOAD_GAME ---- */
+	BootStatus(13, 0, 0);
+	{
+		u8  last_status = 0;
+		int wr = ra_wait_ready(&last_status);
+		if (wr != 0) {
+			ra_debug("GC-RA PRE-BOOT: adapter not ready");
+			/* portal or stuck pre-login: loader maps the status byte */
+			ra_fatal(-13, (s32)last_status);
+		}
+	}
+
+	/* ---- Stage 14: read the game image + compute the RA hash ---- */
+	BootStatus(14, 0, 0);
+
 	/* ISO/file games: the lazy ISOInit() in DIReadThread hasn't run yet at
 	 * this pre-boot point, so init it ourselves. Disc games are already set
 	 * up by RealDI_Init() during kernel init. */
 	if (!RealDiscCMD && !FSTMode)
 		ISOInit();
 
-	/* Phase 2b-1: prove we can read the game image BEFORE boot. Read the
-	 * disc header (32 bytes at offset 0), log the 6-char Game ID, the first
-	 * 8 header bytes, and the GameCube magic word at 0x1C (must be C2339F3D
-	 * for a valid disc — it's the precondition rc_hash_gamecube checks). */
+	/* Read the disc header (32 bytes at offset 0): the 6-char Game ID for
+	 * LOAD_GAME, plus the GameCube magic word at 0x1C (C2339F3D) that
+	 * rc_hash_gamecube requires — logged for field diagnostics. */
 	if (ra_disc_read(hdr, 0, 32) == 0) {
 		o = 0;
 		const char *p = "disc id=";
@@ -1568,19 +1658,11 @@ void RA_PreBootHandshake(void)
 		}
 		msg[o] = 0;
 		ra_debug(msg);
-
-		o = 0; p = "magic@1C=";
-		while (*p) msg[o++] = *p++;
-		for (i = 0x1C; i < 0x20; i++) { msg[o++] = ra_hexd(hdr[i] >> 4); msg[o++] = ra_hexd(hdr[i] & 0xF); }
-		msg[o] = 0;
-		ra_debug(msg);
 	} else {
 		ra_debug("GC-RA disc read FAILED (pre-boot)");
+		ra_fatal(-14, 1);
 	}
 
-	/* Phase 2b-2: compute the RetroAchievements GameCube hash and log it.
-	 * Reading the header + DOL segments from disc takes a couple of seconds,
-	 * which also serves as the gating delay. */
 	{
 		char hex[33];
 		char gid[7];
@@ -1589,38 +1671,51 @@ void RA_PreBootHandshake(void)
 		for (i = 0; i < 6; i++) gid[i] = (char)hdr[i];
 		gid[6] = 0;
 
+		/* Reading the header + DOL segments takes a couple of seconds. */
 		hr = ra_compute_gc_hash(hex);
-		if (hr == 0) {
-			const char *p;
-			int lr;
-
-			o = 0; p = "ra hash=";
-			while (*p) msg[o++] = *p++;
-			for (i = 0; i < 32; i++) msg[o++] = hex[i];
-			msg[o] = 0;
-			ra_debug(msg);
-
-			/* LOAD_GAME + poll until the ESP fetched the achievement set. */
-			ra_debug("GC-RA LOAD_GAME -> polling for GAME_LOADED");
-			lr = ra_load_game(gid, hex);
-			/* The ESP is busy right at its game-loaded state transition
-			 * (rc_client callback, its own Serial prints), so a debug sent
-			 * immediately gets dropped. Let it settle before reporting. */
-			mdelay(500);
-			if (lr == 0)        ra_debug("GC-RA GAME_LOADED ok <<<");
-			else if (lr == -2)  ra_debug("GC-RA LOAD_GAME error (ESP)");
-			else                ra_debug("GC-RA LOAD_GAME timeout");
-			mdelay(300);
-		} else {
+		if (hr != 0) {
 			const char *p;
 			o = 0; p = "ra hash FAILED rc=-";
 			while (*p) msg[o++] = *p++;
 			msg[o++] = (char)('0' + (-hr));
 			msg[o] = 0;
 			ra_debug(msg);
+			ra_fatal(-14, (s32)(-hr + 1));   /* 2.. = hash step that failed */
+		}
+
+		{
+			const char *p;
+			o = 0; p = "ra hash=";
+			while (*p) msg[o++] = *p++;
+			for (i = 0; i < 32; i++) msg[o++] = hex[i];
+			msg[o] = 0;
+			ra_debug(msg);
+		}
+
+		/* ---- Stage 15: LOAD_GAME -> ESP fetches the achievement set ---- */
+		BootStatus(15, 0, 0);
+		ra_debug("GC-RA LOAD_GAME -> polling for GAME_LOADED");
+		{
+			int lr = ra_load_game(gid, hex);
+			/* The ESP is busy right at its game-loaded state transition
+			 * (rc_client callback, its own Serial prints), so a debug sent
+			 * immediately gets dropped. Let it settle before reporting. */
+			mdelay(500);
+			if (lr == 0) {
+				ra_debug("GC-RA GAME_LOADED ok <<<");
+			} else if (lr > 0) {
+				ra_debug("GC-RA LOAD_GAME error (ESP)");
+				ra_fatal(-15, lr);        /* ESP status byte (0xE0.., 0x08) */
+			} else {
+				ra_debug("GC-RA LOAD_GAME timeout");
+				ra_fatal(-15, 1);         /* 1 = timeout */
+			}
+			mdelay(300);
 		}
 	}
 
+	/* ---- Stage 16: done ---- */
+	BootStatus(16, 0, 0);
 	ra_debug("GC-RA PRE-BOOT done -> releasing game");
 }
 

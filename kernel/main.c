@@ -262,8 +262,12 @@ int _main( int argc, char *argv[] )
 	SOCKInit();
 
 	/* RetroAchievements: synchronous pre-boot handshake. Runs BEFORE we tell
-	 * the PPC loader we're ready, so the game launch waits for it (Phase 2a). */
-	RA_PreBootHandshake();
+	 * the PPC loader we're ready, so the game launch waits for it (Phase 2a).
+	 * Gated by the loader's "RetroAchievements" setting: Off = the adapter
+	 * is never touched and boot is unaffected; On = the adapter is REQUIRED
+	 * and any failure aborts the boot with a specific loader message. */
+	if (ConfigGetConfig(NIN_CFG_RA))
+		RA_PreBootHandshake();
 
 //Tell PPC side we are ready!
 	cc_ahbMemFlush(1);
@@ -338,10 +342,11 @@ int _main( int argc, char *argv[] )
 			write32(0xd8006a0, 0x30000002), mask32(0xd8006a8, 0, 2);
 	}
 
-	/* RetroAchievements memory server — Phase 0 proof of life. Spawns a
-	 * background thread that drives the real EXI bus to the ESP32 in Slot B.
-	 * See RA_PORT_PLAN.md / ra_module.c. */
-	RA_Init();
+	/* RetroAchievements memory server — spawns the background thread that
+	 * drives the real EXI bus to the ESP32 in Slot B (watchlist + snapshots).
+	 * Gated by the same loader setting as the pre-boot handshake above. */
+	if (ConfigGetConfig(NIN_CFG_RA))
+		RA_Init();
 
 	while (1)
 	{
