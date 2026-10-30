@@ -52,6 +52,7 @@ enum ninconfigbitpos
 	NIN_CFG_BIT_CC_RUMBLE	= (17),
 	NIN_CFG_BIT_SKIP_IPL	= (18),
 	NIN_CFG_BIT_BBA_EMU		= (19),
+	NIN_CFG_BIT_RA			= (20),	// RetroAchievements via ESP32 adapter (Slot B)
 
 	// Internal kernel settings.
 	NIN_CFG_BIT_MC_SLOTB	= (31),	// Slot B image is loaded
@@ -81,6 +82,7 @@ enum ninconfig
 	NIN_CFG_CC_RUMBLE	= (1<<NIN_CFG_BIT_CC_RUMBLE),
 	NIN_CFG_SKIP_IPL	= (1<<NIN_CFG_BIT_SKIP_IPL),
 	NIN_CFG_BBA_EMU		= (1<<NIN_CFG_BIT_BBA_EMU),
+	NIN_CFG_RA			= (1<<NIN_CFG_BIT_RA),
 
 	NIN_CFG_MC_SLOTB	= (1<<NIN_CFG_BIT_MC_SLOTB),
 };

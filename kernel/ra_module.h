@@ -57,6 +57,30 @@
  * 0 = async sampling (high df/s, the proven-stable behavior); 1 = frame-aligned. */
 #define RA_FRAME_ALIGN        0
 
+/* ------------------------------------------------------------------------
+ * True vertical-retrace clock (2026-10-19, default ON).
+ *
+ * The 0x1004 counter above ticks on a framebuffer FLIP, so it freezes on
+ * single-framebuffer games (The Simpsons: Road Rage) and counts rendered frames,
+ * not video fields. Emulators run one frame per VI field (59.94 / 50 Hz), so
+ * RA_RetraceHook (called from Patch.c right after the codehandler copy) finds
+ * the SDK's `retraceCount++` inside __VIRetraceHandler and redirects its store
+ * through a tiny stub at RA_RETRACE_STUB_PHYS that ALSO publishes the new count
+ * UNCACHED at RA_RETRACE_SLOT_PHYS (a cached store would sit in Broadway's
+ * write-back cache). The RA loop accepts it only after measuring 45-65 Hz, then
+ * waits for each retrace before sampling MEM1 (frame-boundary snapshots, like
+ * Dolphin) and numbers frames by it. Anything off -> previous behavior.
+ * Both addresses are in the codehandler cheatdata scratch (0x1000-0x109F,
+ * zeroed and unused without a GCT; the stub is rewritten after every copy).
+ * ------------------------------------------------------------------------ */
+#define RA_USE_RETRACE        1
+#define RA_RETRACE_SLOT_PHYS  0x1020u   /* u32 retraceCount mirror (PPC writes uncached) */
+#define RA_RETRACE_STUB_PHYS  0x1040u   /* 8-instruction stub */
+
+/* Find + hook the game's retraceCount++ (see above). buf/len = the code just
+ * patched by DoPatches (the main DOL on the call that matters). */
+void RA_RetraceHook(u32 buf, u32 len);
+
 /* RA background-thread priority (2026-06-23): created at 0x78 (= main/DI/HID/BT/SO
  * tier) so the snapshot loop isn't preempted during its active EXI work — this
  * ~doubled df/s on preemption-limited games (Melee 20→60). IOS only lets a

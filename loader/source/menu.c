@@ -1080,6 +1080,21 @@ static const char *const *GetSettingsDescription(const MenuCtx *ctx)
 				return desc_skip_bba;
 			}
 
+			case 9: {
+				// RetroAchievements
+				static const char *desc_ra[] = {
+					"Track RetroAchievements with",
+					"the ESP32 adapter in Slot B.",
+					"",
+					"When On the adapter is",
+					"REQUIRED: boot stops if it",
+					"is missing, offline, or the",
+					"game is not in the RA DB.",
+					NULL
+				};
+				return desc_ra;
+			}
+
 			case 7: {
 				// BBA Network Profile
 				static const char *desc_skip_netprof[] = {
@@ -1153,7 +1168,7 @@ static bool UpdateSettingsMenu(MenuCtx *ctx)
 
 		// Check for wraparound.
 		if ((ctx->settings.settingPart == 0 && ctx->settings.posX >= NIN_SETTINGS_LAST) ||
-		    (ctx->settings.settingPart == 1 && ctx->settings.posX >= 9))
+		    (ctx->settings.settingPart == 1 && ctx->settings.posX >= 10))
 		{
 			ctx->settings.posX = 0;
 			ctx->settings.settingPart ^= 1;
@@ -1180,7 +1195,7 @@ static bool UpdateSettingsMenu(MenuCtx *ctx)
 			if (ctx->settings.settingPart == 0) {
 				ctx->settings.posX = NIN_SETTINGS_LAST - 1;
 			} else {
-				ctx->settings.posX = 8;
+				ctx->settings.posX = 9;
 			}
 		}
 
@@ -1437,6 +1452,13 @@ static bool UpdateSettingsMenu(MenuCtx *ctx)
 					ctx->redraw = true;
 					break;
 
+				case 9:
+					// RetroAchievements (ESP32 adapter in Slot B)
+					ctx->saveSettings = true;
+					ncfg->Config ^= (NIN_CFG_RA);
+					ctx->redraw = true;
+					break;
+
 				default:
 					break;
 			}
@@ -1625,8 +1647,13 @@ static bool UpdateSettingsMenu(MenuCtx *ctx)
 					"%-18s:%d", "WiiU Gamepad Slot", (ncfg->WiiUGamepadSlot + 1));
 		} else {
 			PrintFormat(MENU_SIZE, (IsWiiU() ? BLACK : DARK_GRAY), MENU_POS_X+320, SettingY(ListLoopIndex),
-			"%-18s:%-4s", "WiiU Gamepad Slot", "None");	
+			"%-18s:%-4s", "WiiU Gamepad Slot", "None");
 		}
+		ListLoopIndex++;
+
+		// RetroAchievements (ESP32 adapter in Memory Card Slot B).
+		PrintFormat(MENU_SIZE, BLACK, MENU_POS_X + 320, SettingY(ListLoopIndex),
+			    "%-18s:%-4s", "RetroAchievements", (ncfg->Config & (NIN_CFG_RA)) ? "On " : "Off");
 		ListLoopIndex++;
 
 		// Draw the cursor.
@@ -1652,7 +1679,7 @@ static bool UpdateSettingsMenu(MenuCtx *ctx)
 		const char *const *desc = GetSettingsDescription(ctx);
 		if (desc != NULL)
 		{
-			int line_num = 9;
+			int line_num = 10;   /* below the RetroAchievements row (index 9) */
 			do {
 				if (**desc != 0)
 				{

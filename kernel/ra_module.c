@@ -25,6 +25,25 @@
 #include "RealDI.h"   /* ReadRealDisc */
 #include "ISO.h"      /* ISORead, ISOInit */
 #include "md5.h"      /* md5_init / md5_append / md5_finish */
+#include "ra_usb_link.h"
+
+/* Console link: 1 = the adapter is on USB (the loader found it and handed its
+ * device id over — ra_usb_link.c), 0 = memory-card adapter in Slot B (EXI).
+ * Chosen once by ra_link_select(); the RA protocol is identical on both. */
+static int ra_usb = 0;
+static int ra_link_selected = 0;
+
+static void ra_link_select(void)
+{
+	if (ra_link_selected)
+		return;
+	ra_link_selected = 1;
+	ra_usb = (RA_UsbLink_Init() == 0);
+}
+
+/* USB exchange timeout: a reply is normally back in a few ms; this only
+ * bounds a stalled adapter (EXI used 100 ms for its INT wait). */
+#define RA_USB_TIMEOUT_MS  100u
 
 /* Game-image read-backend selectors (set during kernel init). */
 extern u32 RealDiscCMD;   /* != 0 => physical disc (RealDI.c) */
@@ -200,6 +219,11 @@ static int ra_imm_read(int ch, u8 *buf, u32 len)
 static int ra_xfer(const void *tx, u32 tx_len, void *rx, u32 rx_len)
 {
 	int r = 0;
+	if (ra_usb) {
+		/* The EXI read phase starts after the tx_len bytes the write phase
+		 * already clocked out of the ESP — skip them in the USB reply. */
+		return (RA_UsbLink_Xfer(tx, tx_len, rx, rx_len, tx_len, RA_USB_TIMEOUT_MS) < 0) ? -1 : 0;
+	}
 	ra_select(RA_CHAN);
 	if (tx && tx_len) r = ra_imm_write(RA_CHAN, (const u8 *)tx, tx_len);
 	if (r == 0 && rx && rx_len) r = ra_imm_read(RA_CHAN, (u8 *)rx, rx_len);
@@ -247,6 +271,15 @@ static int ra_phase_b(const void *tx, u32 tx_len, void *rx, u32 rx_len)
 {
 	int ret;
 
+	if (ra_usb) {
+		/* Request, then the reply from its first byte. -2 = no reply in
+		 * time, same meaning as the EXI INT-wait timeout. */
+		ret = RA_UsbLink_Xfer(tx, tx_len, rx, rx_len, 0, RA_USB_TIMEOUT_MS);
+		if (ret == RA_USBL_ETIMEOUT || ret == RA_USBL_EBUSY)
+			return -2;
+		return (ret < 0) ? -1 : 0;
+	}
+
 	ra_clear_int(RA_CHAN);                 /* drop any stale latch */
 
 	/* WRITE phase */
@@ -289,6 +322,14 @@ static void ra_debug(const char *msg)
 	h->payload_len = (u16)(1 + n);
 	buf[sizeof(ra_gc_header_t)] = (u8)n;
 	memcpy(buf + sizeof(ra_gc_header_t) + 1, msg, n);
+
+	if (ra_usb) {
+		/* USB: the ESP answers every request; read and drop its ACK. No
+		 * settle delay — the reply itself says the ESP is done. */
+		(void)RA_UsbLink_Xfer(buf, sizeof(ra_gc_header_t) + 1 + n, NULL, 0, 0,
+		                      RA_USB_TIMEOUT_MS);
+		return;
+	}
 
 	ra_select(RA_CHAN);
 	ra_imm_write(RA_CHAN, buf, sizeof(ra_gc_header_t) + 1 + n);
@@ -373,8 +414,18 @@ static u32 ra_start_tick = 0;
  * after which we trust it as the frame source (and never fall back, so a paused
  * game correctly stops do_frame instead of the wall-clock running on). */
 static u32 ra_vbi_last  = 0;   /* last counter value read */
-static u32 ra_vbi_base  = 0;   /* counter value when it first went live */
-static int ra_vbi_live  = 0;   /* 1 once the counter has been seen to advance */
+static int ra_vbi_live  = 0;   /* 1 once the counter has advanced RA_VBI_LIVE_ADV times */
+/* 2026-10-19 (The Simpsons: Road Rage): the counter advanced ONCE (2 -> 3) and
+ * then froze for the whole session, so the single-advance latch trusted a dead
+ * clock -> game frame stuck at 0 -> the ESP never left its warm-up spectator
+ * mode and no unlock was submitted. Now: go live only after a run of advances,
+ * and drop back to the wall clock for good if a live counter stalls. */
+#define RA_VBI_LIVE_ADV  30u   /* advances needed before trusting the counter */
+#define RA_VBI_STALL_HW  180u  /* hw frames (~3 s) without an advance = dead */
+static u32 ra_vbi_adv     = 0; /* advances seen while not yet live */
+static u32 ra_vbi_last_hw = 0; /* hw_frame of the last advance */
+static int ra_vbi_dead    = 0; /* 1 = counter judged dead, wall clock for good */
+static u32 ra_prev_hw     = 0; /* hw_frame of the previous loop (delta source) */
 
 /* Read the per-frame VBlank counter the codehandler increments at MEM1 0x1004
  * (codehandler cheatdata scratch). Single fixed address polled repeatedly → the
@@ -386,6 +437,160 @@ static u32 ra_read_vbi(void)
 	u32 a = RA_VBI_COUNTER_PHYS & ~3u;
 	sync_before_read((void*)(a & ~0x1Fu), 0x20);
 	return read32(a);
+}
+#endif
+
+#if RA_USE_RETRACE
+/* ---- True vertical-retrace clock (see ra_module.h) ---------------------- */
+enum { RT_OFF = 0, RT_PROBING, RT_LIVE, RT_DEAD };
+static u32 ra_rt_target   = 0;   /* phys addr of the hooked `stw rY,d(r13)` (0 = none) */
+static u32 ra_rt_orig     = 0;   /* its original instruction */
+static u32 ra_rt_count_ea = 0;   /* the game's retraceCount address (diag) */
+static u32 ra_rt_stub[8];
+static int ra_rt_state    = RT_OFF;
+static u32 ra_rt_last     = 0;   /* last retrace count read */
+static u32 ra_rt_last_hw  = 0;   /* hw_frame of the last retrace advance */
+static u32 ra_rt_probe_v  = 0;   /* count at the start of the rate probe */
+static u32 ra_rt_probe_t  = 0;   /* HW_TIMER at the start of the rate probe */
+static u32 ra_rt_tries    = 0;   /* rate probes run */
+static u32 ra_rt_rate     = 0;   /* last measured rate, retraces per second */
+
+static u32 ra_rt_branch(u32 from, u32 to)
+{
+	return 0x48000000u | ((to - from) & 0x03FFFFFCu);
+}
+
+/* (Re)write the stub and the branch into it. The codehandler copy at 0x1000
+ * wipes the cheatdata scratch, so this runs after EVERY copy. */
+static void ra_rt_install(void)
+{
+	u32 k;
+	for (k = 0; k < 8; k++)
+		write32(RA_RETRACE_STUB_PHYS + k * 4, ra_rt_stub[k]);
+	sync_after_write((void*)RA_RETRACE_STUB_PHYS, 0x20);
+	write32(ra_rt_target, ra_rt_branch(ra_rt_target, RA_RETRACE_STUB_PHYS));
+	sync_after_write((void*)(ra_rt_target & ~0x1Fu), 0x20);
+}
+
+/* Is the word at i an anchor of the VI register block (0xCC002000)?
+ *   lhz rD, 0x2030(rA)                      (VI_DISP_INT_0 read directly), or
+ *   lis rB, 0xCC00 ... addi rV, rB, 0x2000  (base pointer to the VI regs). */
+static int ra_rt_is_anchor(u32 i, u32 start)
+{
+	u32 w = read32(i), rb, k;
+	if ((w & 0xFC00FFFFu) == 0xA0002030u)
+		return 1;
+	if ((w >> 26) != 14 || (w & 0xFFFFu) != 0x2000u)
+		return 0;
+	rb = (w >> 16) & 31;
+	if (rb == 0)
+		return 0;
+	for (k = 1; k <= 8 && i >= start + k * 4; k++)
+		if (read32(i - k * 4) == (0x3C00CC00u | (rb << 21)))
+			return 1;
+	return 0;
+}
+
+/* After an anchor, within 0x400 bytes, the SDK's __VIRetraceHandler does
+ *     retraceCount++;  ...  if (PreCB) PreCB(retraceCount);
+ * compiled (Melee, Metroid Prime) as
+ *     lwz rX,d(r13) ; [<=2 others] ; addi rY,rX,1 ; [<=2] ; stw rY,d(r13)
+ * followed within 12 instructions by lwz r3,d(r13) (the PreCB argument) —
+ * that confirmation makes the match specific. Returns the stw address (0 =
+ * none); *out_d = the r13 displacement. Verified offline on GALE01 / GM8E01:
+ * one match each, and a VIGetRetraceCount (lwz r3,d(r13); blr) agrees. */
+static u32 ra_rt_find_inc(u32 start, u32 end, u32 *out_d)
+{
+	u32 i, j, k;
+	for (i = start; i + 4 <= end; i += 4) {
+		u32 lim;
+		if (!ra_rt_is_anchor(i, start))
+			continue;
+		lim = i + 0x400;
+		if (lim > end - 80)   /* room for lwz..addi..stw + 12 confirmation words */
+			lim = end - 80;
+		for (j = i + 4; j <= lim; j += 4) {
+			u32 l = read32(j), rx, ry, d, ad = 0, s = 0, conf = 0;
+			if ((l & 0xFC1F0000u) != 0x800D0000u)                        /* lwz rX, d(r13) */
+				continue;
+			rx = (l >> 21) & 31;
+			d  = l & 0xFFFFu;
+			for (k = 1; k <= 3 && !ad; k++)
+				if ((read32(j + k * 4) & 0xFC1FFFFFu) == (0x38000001u | (rx << 16))) /* addi rY, rX, 1 */
+					ad = j + k * 4;
+			if (!ad)
+				continue;
+			ry = (read32(ad) >> 21) & 31;
+			for (k = 1; k <= 3 && !s; k++)
+				if (read32(ad + k * 4) == (0x900D0000u | (ry << 21) | d))   /* stw rY, d(r13) */
+					s = ad + k * 4;
+			if (!s)
+				continue;
+			for (k = 1; k <= 12 && !conf; k++)
+				if (read32(s + k * 4) == (0x806D0000u | d))                  /* lwz r3, d(r13) */
+					conf = 1;
+			if (!conf)
+				continue;
+			*out_d = d;
+			return s;
+		}
+	}
+	return 0;
+}
+
+void RA_RetraceHook(u32 buf, u32 len)
+{
+	u32 i, end = buf + len, sda = 0, t, d = 0, ry, rt;
+
+	if (ra_rt_target) {
+		u32 cur = read32(ra_rt_target);
+		if (cur == ra_rt_orig || cur == ra_rt_branch(ra_rt_target, RA_RETRACE_STUB_PHYS)) {
+			ra_rt_install();   /* same game: restore the stub the copy just wiped */
+			return;
+		}
+		ra_rt_target = 0;      /* the code changed (reset / other DOL): rescan */
+	}
+	if (len < 0x100)
+		return;
+
+	/* 1. SDA base: crt0 __init_registers does lis r13,hi ; ori/addi r13,r13,lo. */
+	for (i = buf; i + 8 <= end; i += 4) {
+		u32 a = read32(i), b;
+		if ((a & 0xFFFF0000u) != 0x3DA00000u)
+			continue;
+		b = read32(i + 4);
+		if ((b & 0xFFFF0000u) == 0x61AD0000u) { sda = (a << 16) | (b & 0xFFFFu); break; }
+		if ((b & 0xFFFF0000u) == 0x39AD0000u) { sda = (a << 16) + (u32)(s32)(s16)(b & 0xFFFFu); break; }
+	}
+	if (!sda)
+		return;
+
+	/* 2. __VIRetraceHandler's retraceCount++ (see ra_rt_find_inc). The runtime
+	 * rate check in the RA loop still rejects anything that is not ~60/50 Hz. */
+	t = ra_rt_find_inc(buf, end, &d);
+	if (!t)
+		return;
+
+	ra_rt_count_ea = sda + (u32)(s32)(s16)d;
+	ra_rt_orig = read32(t);
+	ry = (ra_rt_orig >> 21) & 31;
+	rt = (ry == 12) ? 11 : 12;                      /* scratch register, saved */
+	ra_rt_stub[0] = ra_rt_orig;                                   /* stw rY, d(r13)        */
+	ra_rt_stub[1] = 0x9421FFF0u;                                  /* stwu r1, -16(r1)       */
+	ra_rt_stub[2] = 0x90010008u | (rt << 21);                     /* stw rT, 8(r1)          */
+	ra_rt_stub[3] = 0x3C00C000u | (rt << 21);                     /* lis rT, 0xC000         */
+	ra_rt_stub[4] = 0x90000000u | (ry << 21) | (rt << 16) | RA_RETRACE_SLOT_PHYS; /* stw rY, slot(rT) */
+	ra_rt_stub[5] = 0x80010008u | (rt << 21);                     /* lwz rT, 8(r1)          */
+	ra_rt_stub[6] = 0x38210010u;                                  /* addi r1, r1, 16        */
+	ra_rt_stub[7] = ra_rt_branch(RA_RETRACE_STUB_PHYS + 28, t + 4); /* b back               */
+	ra_rt_target = t;
+	ra_rt_install();
+}
+
+static u32 ra_read_rt(void)
+{
+	sync_before_read((void*)(RA_RETRACE_SLOT_PHYS & ~0x1Fu), 0x20);
+	return read32(RA_RETRACE_SLOT_PHYS);
 }
 #endif
 static u32 ra_pending_q[RA_ADDR_QUERY_MAX] __attribute__((aligned(32)));
@@ -403,14 +608,26 @@ static u8  ra_ach_fired = 0;
 /* SNAPSHOT tx: 8192 like the canonical d2x ra-module — Phase C snapshots
  * carry flat values + the chain window (bitmap + blob) + dp sections; the
  * window budget in ra_send_snapshot is derived from sizeof() this buffer. */
-static u8 ra_snap_tx[8192]        __attribute__((aligned(32)));
+/* Page-aligned for the USB link: one transfer may cross only ONE 4 KB page
+ * boundary (OHCI), and on USB the window budget stops one byte short of 8192
+ * (an 8192-byte message would get a framing pad) — see ra_snap_budget(). */
+static u8 ra_snap_tx[8192]        __attribute__((aligned(4096)));
 static u8 ra_snap_rx[RA_RESP_LEN] __attribute__((aligned(32)));
+
+static u32 ra_snap_budget(void)
+{
+	return ra_usb ? RA_USBL_TX_MAX : sizeof(ra_snap_tx);
+}
 /* GET_CHUNK response via Phase B: 6(FF pad)+6(esp_hdr)+hdr+payload.
  *   watchlist: 6 + 6 + 6 + 1024×4 = 4114
  *   chain:     6 + 6 + 8 + 512×8  = 4116  (RA_CHAIN_CHUNK_NODES nodes)
  * The leading 6-byte pad (GC_WRITE_PADDING the ESP prepends) lands at the start
  * of the Phase B read, so the buffer needs the extra 6 vs the old 2-tx path. */
-static u8 ra_chunk_rx[6 + 6 + 8 + RA_WATCHLIST_CHUNK_ADDRS * 4] __attribute__((aligned(32)));
+/* +12 for USB: the ESP appends a CRC32 trailer to every chunk (fw v0.35.2+;
+ * this console ignores it) and pads replies to a multiple of 4. Over EXI the
+ * read just stops at the buffer end; a USB read must have room for the whole
+ * reply. 32-aligned and <= 4128 B = at most one page crossing. */
+static u8 ra_chunk_rx[6 + 6 + 8 + RA_WATCHLIST_CHUNK_ADDRS * 4 + 12] __attribute__((aligned(32)));
 
 /* ------------------------------------------------------------------------
  * Phase C chain descriptor table + per-frame walk state (faithful port of
@@ -961,7 +1178,7 @@ static int ra_send_snapshot(void)
 	 * Phase D: the dp verification section (4B per dp entry) is reserved
 	 * OFF THE TOP so the window can never squeeze it out. */
 	if (ra_chain_node_count > 0 && ra_chain_shipped > 0) {
-		u32 avail = sizeof(ra_snap_tx) - sizeof(ra_gc_header_t)
+		u32 avail = ra_snap_budget() - sizeof(ra_gc_header_t)
 		          - sizeof(ra_snapshot_header_t) - count
 		          - (u32)ra_chain_dp_count * 4u
 		          - ((u32)ra_chain_dp_count + 7u) / 8u;  /* dp validity bitmap */
@@ -1076,7 +1293,7 @@ static int ra_send_addr_response(void)
 static u32 RA_PollThread(void *arg)
 {
 	int i;
-	char m[80];
+	char m[128];
 	u32 o;
 	(void)arg;
 
@@ -1145,15 +1362,77 @@ static u32 RA_PollThread(void *arg)
 			/* Frame clock. Baseline: 60 Hz HW_TIMER wall-clock (u32 subtraction
 			 * wraps correctly within the timer's ~38-min period). */
 			u32 hw_frame = (read32(HW_TIMER) - ra_start_tick) / RA_FRAME_TICKS;
+			int rt_used = 0;   /* 1 = this loop's frame number came from the retrace clock */
+#if RA_USE_RETRACE
+			/* True vertical-retrace clock (ra_module.h). Probe its rate for ~1 s;
+			 * once live, wait for the next retrace and sample right after it. */
+			if (ra_rt_target && ra_rt_state == RT_OFF) {
+				ra_rt_state   = RT_PROBING;
+				ra_rt_probe_v = ra_read_rt();
+				ra_rt_probe_t = read32(HW_TIMER);
+			}
+			if (ra_rt_state == RT_PROBING &&
+			    (read32(HW_TIMER) - ra_rt_probe_t) >= RA_FRAME_TICKS * 60u) {
+				u32 now = read32(HW_TIMER), v = ra_read_rt();
+				u32 us = ((now - ra_rt_probe_t) / 1000u) * 527u;
+				char rm[64];
+				u32 ro = 0;
+				const char *rp;
+				ra_rt_rate = us ? (u32)(((v - ra_rt_probe_v) * 1000000u) / us) : 0;
+				if (ra_rt_rate >= 45 && ra_rt_rate <= 65) {
+					ra_rt_state   = RT_LIVE;
+					ra_rt_last    = v;
+					ra_rt_last_hw = hw_frame;
+					rp = "GC-RA retrace clock live: hz=";
+				} else if (++ra_rt_tries >= 5) {
+					ra_rt_state = RT_DEAD;
+					rp = "GC-RA retrace clock rejected for good: hz=";
+				} else {
+					ra_rt_probe_v = v;   /* boot hiccup? measure again */
+					ra_rt_probe_t = now;
+					rp = "GC-RA retrace clock probe failed: hz=";
+				}
+				while (*rp) rm[ro++] = *rp++;
+				ro += ra_appdec(rm + ro, ra_rt_rate);
+				rm[ro++] = ' '; rm[ro++] = '@';
+				ro += ra_apphex8(rm + ro, ra_rt_count_ea);
+				rm[ro] = 0;
+				ra_debug(rm);
+			}
+			if (ra_rt_state == RT_LIVE) {
+				u32 t0 = read32(HW_TIMER), rc = ra_read_rt();
+				/* Frame-boundary sampling: sleep until the next vertical retrace
+				 * (udelay is an IOS timer sleep, not a spin), at most 3 frames. */
+				while (rc == ra_rt_last && (read32(HW_TIMER) - t0) < RA_FRAME_TICKS * 3u) {
+					udelay(250);
+					rc = ra_read_rt();
+				}
+				hw_frame = (read32(HW_TIMER) - ra_start_tick) / RA_FRAME_TICKS;
+				if (rc != ra_rt_last) {
+					ra_game_frame += rc - ra_rt_last;
+					ra_rt_last     = rc;
+					ra_rt_last_hw  = hw_frame;
+					rt_used = 1;
+				} else if ((hw_frame - ra_rt_last_hw) > RA_VBI_STALL_HW) {
+					ra_rt_state = RT_DEAD;
+					ra_debug("GC-RA retrace clock stalled -> fallback");
+				} else {
+					rt_used = 1;   /* a short gap: keep the frame number, sample anyway */
+				}
+			}
+#endif
 #if RA_USE_VBI
 			{
 				u32 vbi = ra_read_vbi();
-				if (!ra_vbi_live) {
-					/* Trust the PPC counter only once we've seen it advance. */
-					if (ra_vbi_last == 0)        ra_vbi_last = vbi;
-					else if (vbi != ra_vbi_last) {
+				u32 prev_vbi = ra_vbi_last;
+				if (ra_vbi_last == 0)
+					prev_vbi = vbi;   /* first read: no delta yet */
+				if (vbi != prev_vbi)
+					ra_vbi_last_hw = hw_frame;
+				if (!ra_vbi_live && !ra_vbi_dead && vbi != prev_vbi) {
+					/* Trust the PPC counter only after a run of advances. */
+					if (++ra_vbi_adv >= RA_VBI_LIVE_ADV) {
 						ra_vbi_live = 1;
-						ra_vbi_base = vbi;   /* zero our frame count at go-live */
 						ra_debug("GC-RA VBI counter live (true game frames)");
 					}
 				}
@@ -1171,7 +1450,16 @@ static u32 RA_PollThread(void *arg)
 					vbi = ra_read_vbi();
 				}
 #endif
-				ra_game_frame = ra_vbi_live ? (vbi - ra_vbi_base) : hw_frame;
+				if (ra_vbi_live && (hw_frame - ra_vbi_last_hw) > RA_VBI_STALL_HW) {
+					ra_vbi_live = 0;
+					ra_vbi_dead = 1;
+					ra_debug("GC-RA VBI counter stalled -> wall clock");
+				}
+				/* Accumulate deltas so the frame clock never jumps back when the
+				 * source switches (the ESP keys its warm-up and debt on it). */
+				if (!rt_used)
+					ra_game_frame += ra_vbi_live ? (vbi - prev_vbi) : (hw_frame - ra_prev_hw);
+				ra_prev_hw = hw_frame;
 				ra_vbi_last = vbi;
 			}
 #else
@@ -1278,6 +1566,14 @@ static u32 RA_PollThread(void *arg)
 				m[o++]=' ';m[o++]='b';m[o++]='x';m[o++]='=';
 				o += ra_appdec(m + o, read32(0x1014u));
 #endif
+#if RA_USE_RETRACE
+				/* Retrace clock: rt = 0 off (not hooked) / 1 probing / 2 live /
+				 * 3 dead; rc = the game's retrace count (59.94/50 per second). */
+				m[o++]=' ';m[o++]='r';m[o++]='t';m[o++]='=';
+				o += ra_appdec(m + o, (u32)ra_rt_state);
+				m[o++]=' ';m[o++]='r';m[o++]='c';m[o++]='=';
+				o += ra_appdec(m + o, ra_rt_target ? ra_read_rt() : 0);
+#endif
 				m[o] = 0;
 				ra_debug(m);
 			}
@@ -1286,6 +1582,10 @@ static u32 RA_PollThread(void *arg)
 			 * the gate above pace us — skip the timer then. Otherwise (frame-align
 			 * off, or no VBI) use the HW_TIMER pacing (which adds no delay anyway
 			 * once per-snapshot work overruns 60 Hz). */
+#if RA_USE_RETRACE
+			/* Retrace live: the wait for the next retrace above IS the cadence. */
+			if (ra_rt_state != RT_LIVE)
+#endif
 #if RA_FRAME_ALIGN
 			if (!ra_vbi_live)
 #endif
@@ -1456,13 +1756,68 @@ static int ra_compute_gc_hash(char out_hex[33])
 }
 
 /* ------------------------------------------------------------------------
+ * One POLL round-trip. Returns 0 and fills *status on a coherent response,
+ * -1 on EXI failure / bad magic (half-duplex idle FF — caller keeps polling).
+ * ------------------------------------------------------------------------ */
+static int ra_poll_status(u8 *status)
+{
+	ra_gc_header_t poll;
+	u8 rx[sizeof(ra_esp_header_t)];
+	const ra_esp_header_t *r;
+
+	poll.magic       = RA_MAGIC_GC_TO_ESP;
+	poll.command     = RA_CMD_POLL;
+	poll.payload_len = 0;
+	memset(rx, 0, sizeof(rx));
+	if (ra_xfer(&poll, sizeof(poll), rx, sizeof(rx)) != 0)
+		return -1;
+	r = (const ra_esp_header_t *)rx;
+	if (r->magic != RA_MAGIC_ESP_TO_GC)
+		return -1;
+	*status = r->status;
+	return 0;
+}
+
+/* ------------------------------------------------------------------------
+ * Wait until the adapter is READY for LOAD_GAME (status >= LOGGED_IN). Right
+ * after power-on the ESP may still be joining WiFi or logging in (0x00-0x03)
+ * — fw v0.35.0+ answers EXI during that window and exposes the progress.
+ * Old error states (0xE0+) also count as ready: sending LOAD_GAME is exactly
+ * how a new attempt resets them. The config portal never resolves by
+ * waiting, so it fails immediately.
+ *
+ * Returns 0 = ready, 1 = portal (not configured), -1 = timeout.
+ * *last_status = last status seen (for the caller's error report).
+ * ------------------------------------------------------------------------ */
+#define RA_READY_POLLS       200   /* × 300 ms ≈ 60 s (router boot headroom) */
+
+static int ra_wait_ready(u8 *last_status)
+{
+	int attempt;
+	*last_status = 0;
+	for (attempt = 0; attempt < RA_READY_POLLS; attempt++) {
+		u8 st;
+		if (ra_poll_status(&st) == 0) {
+			*last_status = st;
+			if (st == RA_STATUS_PORTAL)
+				return 1;
+			if (st >= RA_STATUS_LOGGED_IN)
+				return 0;
+		}
+		mdelay(300);
+	}
+	return -1;
+}
+
+/* ------------------------------------------------------------------------
  * LOAD_GAME + poll for GAME_LOADED. Mirrors WiiFlow ra_exi.c: the response in
  * the same (half-duplex) transaction is unreliable, so we send LOAD_GAME and
  * then poll RA_CMD_POLL until the ESP reports GAME_LOADED/ACTIVE (it fetches
  * the achievement set from the RA server, which can take a while). The ESP
  * prints its own progress on Serial; we just wait for the terminal status.
  *
- * Returns 0 on GAME_LOADED/ACTIVE, -2 on ESP error status, -1 on timeout.
+ * Returns 0 on GAME_LOADED/ACTIVE, the ESP status byte (>0, 0xE0.. or
+ * RA_STATUS_PORTAL) on ESP-reported failure, -1 on timeout.
  * ------------------------------------------------------------------------ */
 #define RA_LOADGAME_POLLS    300   /* × 300 ms ≈ 90 s */
 #define RA_LOADGAME_POLL_MS  300
@@ -1497,47 +1852,54 @@ static int ra_load_game(const char *game_id6, const char *md5_hex)
 
 	/* Poll until terminal status. */
 	for (attempt = 0; attempt < RA_LOADGAME_POLLS; attempt++) {
-		ra_gc_header_t poll;
-		const ra_esp_header_t *r;
+		u8 st;
 
 		mdelay(RA_LOADGAME_POLL_MS);
 
-		poll.magic       = RA_MAGIC_GC_TO_ESP;
-		poll.command     = RA_CMD_POLL;
-		poll.payload_len = 0;
-		memset(rx, 0, sizeof(rx));
-		if (ra_xfer(&poll, sizeof(poll), rx, sizeof(rx)) != 0)
-			continue;
-
-		r = (const ra_esp_header_t *)rx;
-		if (r->magic != RA_MAGIC_ESP_TO_GC)
+		if (ra_poll_status(&st) != 0)
 			continue;                       /* half-duplex idle FF — keep polling */
-		if (r->status == RA_STATUS_GAME_LOADED || r->status == RA_STATUS_ACTIVE)
+		if (st == RA_STATUS_GAME_LOADED || st == RA_STATUS_ACTIVE)
 			return 0;
-		if (r->status >= RA_STATUS_ERROR_WIFI)
-			return -2;
+		if (st == RA_STATUS_PORTAL || RA_STATUS_IS_ERROR(st))
+			return (int)st;
 	}
 	return -1;
 }
 
 /* ------------------------------------------------------------------------
- * Phase 2a — synchronous pre-boot handshake.
+ * Fatal pre-boot RA failure: report the stage (-12..-15) + detail code to
+ * the PPC loader (it prints the specific message in MAROON), give the user
+ * time to read it, then shut down — the same pattern Nintendont uses for
+ * its own fatal boot errors (storage/FS init). The RetroAchievements
+ * setting is On, so a silent no-achievements boot would defeat the point.
+ * ------------------------------------------------------------------------ */
+static void NORETURN ra_fatal(s32 stage, s32 detail)
+{
+	BootStatusError(stage, detail);
+	mdelay(8000);   /* let the user read the loader message */
+	Shutdown();
+}
+
+/* ------------------------------------------------------------------------
+ * Phase 2a/2b — synchronous pre-boot handshake (only when the loader's
+ * RetroAchievements setting is On).
  *
  * Called from main() right before the kernel tells the PPC loader it is
  * ready (BootStatus(0xdeadbeef)). While we block here, the loader sits in
- * its "Loading patched kernel..." wait loop and the GameCube game has NOT
- * started — exactly the window we want for game identification + achievement
- * fetch.
+ * its boot-status screen and the GameCube game has NOT started — exactly
+ * the window for game identification + achievement fetch, and the loader
+ * displays each stage via BootStatus 12-16:
  *
- * For now this only validates the gating: a few IDENTIFY round-trips to
- * confirm the EXI link works at this pre-boot point, then a deliberate
- * multi-second delay simulating the ESP's RA-server fetch. On hardware we
- * expect the game boot to be visibly delayed by this block, with the
- * PRE-BOOT debug lines appearing on the ESP's COM4 BEFORE the game runs.
+ *   12  probe adapter (fail fast — no 90 s wait when it's unplugged)
+ *   13  wait for adapter ready (its WiFi join / RA login after power-on)
+ *   14  read the game image + compute the RA GameCube MD5
+ *   15  LOAD_GAME -> ESP downloads the achievement set
+ *   16  done — achievements ready, game boot proceeds
  *
- * Phase 2b will replace the simulated delay with: read disc header + DOL via
- * ReadRealDisc/ISORead, compute the RetroAchievements GameCube MD5, send
- * RA_CMD_LOAD_GAME (has_hash=1), and poll RA_CMD_POLL until GAME_LOADED.
+ * Any failure calls ra_fatal(-stage, detail): the loader shows WHY (no
+ * adapter / portal / no internet / login rejected / unknown hash = bad
+ * dump / timeout) and the console shuts down instead of silently playing
+ * without achievements.
  * ------------------------------------------------------------------------ */
 void RA_PreBootHandshake(void)
 {
@@ -1548,16 +1910,48 @@ void RA_PreBootHandshake(void)
 	led_setup();
 	led_blink(3, 80);   /* entering pre-boot handshake */
 
+	/* USB adapter (loader handoff) or memory-card adapter (Slot B). */
+	ra_link_select();
+	ra_debug(ra_usb ? "GC-RA link: USB" : "GC-RA link: EXI (Slot B)");
+
+	/* ---- Stage 12: adapter presence (fail fast) ---- */
+	BootStatus(12, 0, 0);
+	{
+		int found = 0;
+		for (i = 0; i < 5; i++) {
+			if (ra_identify() == 0) { found = 1; break; }
+			mdelay(50);
+		}
+		if (!found) {
+			ra_debug("GC-RA PRE-BOOT: adapter not detected");
+			ra_fatal(-12, 0);
+		}
+	}
+
+	/* ---- Stage 13: wait until the adapter is ready for LOAD_GAME ---- */
+	BootStatus(13, 0, 0);
+	{
+		u8  last_status = 0;
+		int wr = ra_wait_ready(&last_status);
+		if (wr != 0) {
+			ra_debug("GC-RA PRE-BOOT: adapter not ready");
+			/* portal or stuck pre-login: loader maps the status byte */
+			ra_fatal(-13, (s32)last_status);
+		}
+	}
+
+	/* ---- Stage 14: read the game image + compute the RA hash ---- */
+	BootStatus(14, 0, 0);
+
 	/* ISO/file games: the lazy ISOInit() in DIReadThread hasn't run yet at
 	 * this pre-boot point, so init it ourselves. Disc games are already set
 	 * up by RealDI_Init() during kernel init. */
 	if (!RealDiscCMD && !FSTMode)
 		ISOInit();
 
-	/* Phase 2b-1: prove we can read the game image BEFORE boot. Read the
-	 * disc header (32 bytes at offset 0), log the 6-char Game ID, the first
-	 * 8 header bytes, and the GameCube magic word at 0x1C (must be C2339F3D
-	 * for a valid disc — it's the precondition rc_hash_gamecube checks). */
+	/* Read the disc header (32 bytes at offset 0): the 6-char Game ID for
+	 * LOAD_GAME, plus the GameCube magic word at 0x1C (C2339F3D) that
+	 * rc_hash_gamecube requires — logged for field diagnostics. */
 	if (ra_disc_read(hdr, 0, 32) == 0) {
 		o = 0;
 		const char *p = "disc id=";
@@ -1568,19 +1962,11 @@ void RA_PreBootHandshake(void)
 		}
 		msg[o] = 0;
 		ra_debug(msg);
-
-		o = 0; p = "magic@1C=";
-		while (*p) msg[o++] = *p++;
-		for (i = 0x1C; i < 0x20; i++) { msg[o++] = ra_hexd(hdr[i] >> 4); msg[o++] = ra_hexd(hdr[i] & 0xF); }
-		msg[o] = 0;
-		ra_debug(msg);
 	} else {
 		ra_debug("GC-RA disc read FAILED (pre-boot)");
+		ra_fatal(-14, 1);
 	}
 
-	/* Phase 2b-2: compute the RetroAchievements GameCube hash and log it.
-	 * Reading the header + DOL segments from disc takes a couple of seconds,
-	 * which also serves as the gating delay. */
 	{
 		char hex[33];
 		char gid[7];
@@ -1589,38 +1975,51 @@ void RA_PreBootHandshake(void)
 		for (i = 0; i < 6; i++) gid[i] = (char)hdr[i];
 		gid[6] = 0;
 
+		/* Reading the header + DOL segments takes a couple of seconds. */
 		hr = ra_compute_gc_hash(hex);
-		if (hr == 0) {
-			const char *p;
-			int lr;
-
-			o = 0; p = "ra hash=";
-			while (*p) msg[o++] = *p++;
-			for (i = 0; i < 32; i++) msg[o++] = hex[i];
-			msg[o] = 0;
-			ra_debug(msg);
-
-			/* LOAD_GAME + poll until the ESP fetched the achievement set. */
-			ra_debug("GC-RA LOAD_GAME -> polling for GAME_LOADED");
-			lr = ra_load_game(gid, hex);
-			/* The ESP is busy right at its game-loaded state transition
-			 * (rc_client callback, its own Serial prints), so a debug sent
-			 * immediately gets dropped. Let it settle before reporting. */
-			mdelay(500);
-			if (lr == 0)        ra_debug("GC-RA GAME_LOADED ok <<<");
-			else if (lr == -2)  ra_debug("GC-RA LOAD_GAME error (ESP)");
-			else                ra_debug("GC-RA LOAD_GAME timeout");
-			mdelay(300);
-		} else {
+		if (hr != 0) {
 			const char *p;
 			o = 0; p = "ra hash FAILED rc=-";
 			while (*p) msg[o++] = *p++;
 			msg[o++] = (char)('0' + (-hr));
 			msg[o] = 0;
 			ra_debug(msg);
+			ra_fatal(-14, (s32)(-hr + 1));   /* 2.. = hash step that failed */
+		}
+
+		{
+			const char *p;
+			o = 0; p = "ra hash=";
+			while (*p) msg[o++] = *p++;
+			for (i = 0; i < 32; i++) msg[o++] = hex[i];
+			msg[o] = 0;
+			ra_debug(msg);
+		}
+
+		/* ---- Stage 15: LOAD_GAME -> ESP fetches the achievement set ---- */
+		BootStatus(15, 0, 0);
+		ra_debug("GC-RA LOAD_GAME -> polling for GAME_LOADED");
+		{
+			int lr = ra_load_game(gid, hex);
+			/* The ESP is busy right at its game-loaded state transition
+			 * (rc_client callback, its own Serial prints), so a debug sent
+			 * immediately gets dropped. Let it settle before reporting. */
+			mdelay(500);
+			if (lr == 0) {
+				ra_debug("GC-RA GAME_LOADED ok <<<");
+			} else if (lr > 0) {
+				ra_debug("GC-RA LOAD_GAME error (ESP)");
+				ra_fatal(-15, lr);        /* ESP status byte (0xE0.., 0x08) */
+			} else {
+				ra_debug("GC-RA LOAD_GAME timeout");
+				ra_fatal(-15, 1);         /* 1 = timeout */
+			}
+			mdelay(300);
 		}
 	}
 
+	/* ---- Stage 16: done ---- */
+	BootStatus(16, 0, 0);
 	ra_debug("GC-RA PRE-BOOT done -> releasing game");
 }
 
@@ -1628,6 +2027,8 @@ void RA_Init(void)
 {
 	/* Stack carved out of the kernel stack region by kernel.ld. */
 	extern char __ra_stack_addr, __ra_stack_size;
+
+	ra_link_select();   /* normally already done by RA_PreBootHandshake */
 
 	/* Priority 0x30 — BELOW the kernel main loop (0x50) and DI (0x78). The
 	 * main loop services the running game's EXI/SI emulation; if RA ran at

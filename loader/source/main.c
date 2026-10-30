@@ -48,6 +48,8 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #include "TRI.h"
 #include "Config.h"
 #include "wdvd.h"
+#include "ra_usb_probe.h"
+#include "../../common/include/RAUsbProbe.h"
 
 #include "ff_utf8.h"
 #include "diskio.h"
@@ -1207,8 +1209,19 @@ int main(int argc, char **argv)
 		}
 	}
 
+	/* RetroAchievements over USB (PLAN-USB-SPIKE.md §12): look for the USB
+	 * adapter and hand its device id to the kernel, which then carries the RA
+	 * protocol over USB instead of Slot B. Must run while USB is still up,
+	 * i.e. before CloseDevices. Only with RA On (the search can take ~2 s);
+	 * the spike build always ran it. */
+	bool ra_usb_handoff = !isWiiVC && (RA_USB_PROBE || (ncfg->Config & NIN_CFG_RA));
+	if(ra_usb_handoff)
+		RA_USBP_Handoff();
+
 	//sync changes
 	CloseDevices();
+	if(ra_usb_handoff)
+		RA_USBP_Release();
 
 	WPAD_Disconnect(0);
 	WPAD_Disconnect(1);
@@ -1372,6 +1385,58 @@ int main(int argc, char **argv)
 				PrintFormat(DEFAULT_SIZE, BLACK, MENU_POS_X, MENU_POS_Y + 20*15, "Init CARD...");
 			if(abs(STATUS_LOADING) > 10 && abs(STATUS_LOADING) < 20)
 				PrintFormat(DEFAULT_SIZE, BLACK, MENU_POS_X, MENU_POS_Y + 20*15, "Init CARD... Done!");
+
+			/* RetroAchievements pre-boot handshake (kernel stages 12-16,
+			 * only when the RetroAchievements setting is On). One line that
+			 * updates in place; negative = fatal, kernel shuts down after
+			 * a few seconds — the message explains exactly what failed. */
+			if(STATUS_LOADING == 12)
+				PrintFormat(DEFAULT_SIZE, BLACK, MENU_POS_X, MENU_POS_Y + 20*16, "RA: detecting adapter... %35s", " ");
+			if(STATUS_LOADING == 13)
+				PrintFormat(DEFAULT_SIZE, BLACK, MENU_POS_X, MENU_POS_Y + 20*16, "RA: waiting for adapter (WiFi/login)... %20s", " ");
+			if(STATUS_LOADING == 14)
+				PrintFormat(DEFAULT_SIZE, BLACK, MENU_POS_X, MENU_POS_Y + 20*16, "RA: computing game hash... %33s", " ");
+			if(STATUS_LOADING == 15)
+				PrintFormat(DEFAULT_SIZE, BLACK, MENU_POS_X, MENU_POS_Y + 20*16, "RA: downloading achievement data... %24s", " ");
+			if(STATUS_LOADING == 16)
+				PrintFormat(DEFAULT_SIZE, BLACK, MENU_POS_X, MENU_POS_Y + 20*16, "RA: achievements ready! %36s", " ");
+			if(STATUS_LOADING == -12)
+				PrintFormat(DEFAULT_SIZE, MAROON, MENU_POS_X, MENU_POS_Y + 20*16, "RA: adapter not detected in Slot B! Shutting down");
+			if(STATUS_LOADING == -13)
+			{
+				if(STATUS_ERROR == 0x08)
+					PrintFormat(DEFAULT_SIZE, MAROON, MENU_POS_X, MENU_POS_Y + 20*16, "RA: adapter unconfigured! Use the WII_RA_ADAPTER WiFi portal");
+				else if(STATUS_ERROR <= 0x02)
+					PrintFormat(DEFAULT_SIZE, MAROON, MENU_POS_X, MENU_POS_Y + 20*16, "RA: adapter can't join WiFi! Shutting down");
+				else
+					PrintFormat(DEFAULT_SIZE, MAROON, MENU_POS_X, MENU_POS_Y + 20*16, "RA: adapter not ready (status %d)! Shutting down", STATUS_ERROR);
+			}
+			if(STATUS_LOADING == -14)
+				PrintFormat(DEFAULT_SIZE, MAROON, MENU_POS_X, MENU_POS_Y + 20*16, "RA: can't read/hash the game image (err %d)! Shutting down", STATUS_ERROR);
+			if(STATUS_LOADING == -15)
+			{
+				switch(STATUS_ERROR)
+				{
+					case 0xE0:
+						PrintFormat(DEFAULT_SIZE, MAROON, MENU_POS_X, MENU_POS_Y + 20*16, "RA: adapter has no internet! Shutting down");
+						break;
+					case 0xE1:
+						PrintFormat(DEFAULT_SIZE, MAROON, MENU_POS_X, MENU_POS_Y + 20*16, "RA: login rejected! Reconfigure the adapter credentials");
+						break;
+					case 0xE4:
+						PrintFormat(DEFAULT_SIZE, MAROON, MENU_POS_X, MENU_POS_Y + 20*16, "RA: hash not in the RA database - bad dump? Shutting down");
+						break;
+					case 1:
+						PrintFormat(DEFAULT_SIZE, MAROON, MENU_POS_X, MENU_POS_Y + 20*16, "RA: timed out downloading achievements! Shutting down");
+						break;
+					default:
+						PrintFormat(DEFAULT_SIZE, MAROON, MENU_POS_X, MENU_POS_Y + 20*16, "RA: achievement load failed (err %d)! Shutting down", STATUS_ERROR);
+						break;
+				}
+			}
+			/* USB transport SPIKE: handoff status + kernel idle-pass result
+			 * (rows 18-20; row 17 is taken by "kernel looping" below). */
+			RA_USBP_Draw(MENU_POS_Y + 20*18);
 			GRRLIB_Screen2Texture(0, 0, screen_buffer, GX_FALSE); // Copy all status messages
 			GRRLIB_Render();
 			ClearScreen();

@@ -3803,6 +3803,13 @@ void DoPatches( char *Buffer, u32 Length, u32 DiscOffset )
 		 * cheats path only syncs the GCT (3816), which RA-only mode never loads,
 		 * so without this the PPC could run stale garbage at 0x1000. */
 		sync_after_write((void*)0x1000, (cheats_start + cheats_area) - 0x1000);
+#if RA_USE_RETRACE
+		/* RA: hook the game's VI retraceCount++ so the kernel gets a true
+		 * vertical-retrace clock (ra_module.h). Its stub lives in the cheatdata
+		 * scratch the copy above just zeroed, so this runs after every copy. */
+		if (raVbiForce && !debuggerWanted)
+			RA_RetraceHook((u32)Buffer, ((u32)Buffer == DOLMinOff) ? Length : 0); /* scan only the main DOL */
+#endif
 		//copy in gct file if requested
 		if( cheatsWanted && TRIGame != TRI_SB && useipl == 0 )
 		{
