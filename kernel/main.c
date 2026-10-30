@@ -66,6 +66,7 @@ extern char __bss_start, __bss_end;
 extern char __di_stack_addr, __di_stack_size;
 
 #include "ra_module.h"
+#include "ra_usb_probe.h"
 
 u32 virtentry = 0;
 u32 drcAddress = 0;
@@ -269,6 +270,11 @@ int _main( int argc, char *argv[] )
 	if (ConfigGetConfig(NIN_CFG_RA))
 		RA_PreBootHandshake();
 
+	/* USB transport SPIKE (PLAN-USB-SPIKE.md): idle measurement pass while the
+	 * loader still shows its status screen. No-op unless the loader handed
+	 * over the ESP echo device. */
+	RA_USBP_Idle();
+
 //Tell PPC side we are ready!
 	cc_ahbMemFlush(1);
 	mdelay(1000);
@@ -347,6 +353,9 @@ int _main( int argc, char *argv[] )
 	 * Gated by the same loader setting as the pre-boot handshake above. */
 	if (ConfigGetConfig(NIN_CFG_RA))
 		RA_Init();
+
+	/* USB transport SPIKE: in-game measurement thread (skipped when RA is On). */
+	RA_USBP_Start();
 
 	while (1)
 	{

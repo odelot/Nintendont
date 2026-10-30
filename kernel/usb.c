@@ -125,6 +125,37 @@ s32 USB_Initialize()
 	return IPC_OK;
 }
 
+/* USB transport spike: lets the probe report whether IOS_Open succeeded
+ * (USB_Initialize itself always returns IPC_OK). */
+s32 USB_GetVenFd(void)
+{
+	return ven_fd;
+}
+
+/* USB transport spike: bulk transfer completed through a message queue.
+ * msg (32-aligned) and ipcmsg must stay alive until the queue delivers
+ * ipcmsg; the transfer result is then in ipcmsg->result. */
+s32 USB_BlkMsgAsync(s32 device_id, u8 bEndpoint, u16 wLength, void *rpData,
+                    struct _usb_msg *msg, s32 queue, struct ipcmessage *ipcmsg)
+{
+	u8 endpoint_dir = !!(bEndpoint & USB_ENDPOINT_IN);
+
+	if(((s32)rpData%32)!=0 || ((s32)msg%32)!=0) return IPC_EINVAL;
+
+	memset(msg, 0, sizeof(*msg));
+	msg->fd = device_id;
+	msg->bulk.rpData = rpData;
+	msg->bulk.wLength = wLength;
+	msg->bulk.bEndpoint = bEndpoint;
+	msg->vec[0].data = msg;
+	msg->vec[0].len = 64;
+	msg->vec[1].data = rpData;
+	msg->vec[1].len = wLength;
+
+	return IOS_IoctlvAsync(ven_fd, USBV5_IOCTL_BULKMSG, 2-endpoint_dir, endpoint_dir,
+	                       msg->vec, queue, ipcmsg);
+}
+
 s32 USB_Deinitialize()
 {
 	if (ven_fd >= 0) {

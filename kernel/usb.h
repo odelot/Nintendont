@@ -146,6 +146,10 @@ struct _usb_msg {
 
 s32 USB_Initialize();
 s32 USB_Deinitialize();
+s32 USB_GetVenFd(void);
+struct ipcmessage;
+s32 USB_BlkMsgAsync(s32 device_id, u8 bEndpoint, u16 wLength, void *rpData,
+                    struct _usb_msg *msg, s32 queue, struct ipcmessage *ipcmsg);
 
 s32 USB_ReadIntrMsg(s32 fd,u8 bEndpoint,u16 wLength,void *rpData);
 s32 USB_ReadBlkMsg(s32 fd,u8 bEndpoint,u16 wLength,void *rpData);

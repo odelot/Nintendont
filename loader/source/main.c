@@ -48,6 +48,8 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #include "TRI.h"
 #include "Config.h"
 #include "wdvd.h"
+#include "ra_usb_probe.h"
+#include "../../common/include/RAUsbProbe.h"
 
 #include "ff_utf8.h"
 #include "diskio.h"
@@ -1207,8 +1209,19 @@ int main(int argc, char **argv)
 		}
 	}
 
+	/* RetroAchievements over USB (PLAN-USB-SPIKE.md §12): look for the USB
+	 * adapter and hand its device id to the kernel, which then carries the RA
+	 * protocol over USB instead of Slot B. Must run while USB is still up,
+	 * i.e. before CloseDevices. Only with RA On (the search can take ~2 s);
+	 * the spike build always ran it. */
+	bool ra_usb_handoff = !isWiiVC && (RA_USB_PROBE || (ncfg->Config & NIN_CFG_RA));
+	if(ra_usb_handoff)
+		RA_USBP_Handoff();
+
 	//sync changes
 	CloseDevices();
+	if(ra_usb_handoff)
+		RA_USBP_Release();
 
 	WPAD_Disconnect(0);
 	WPAD_Disconnect(1);
@@ -1421,6 +1434,9 @@ int main(int argc, char **argv)
 						break;
 				}
 			}
+			/* USB transport SPIKE: handoff status + kernel idle-pass result
+			 * (rows 18-20; row 17 is taken by "kernel looping" below). */
+			RA_USBP_Draw(MENU_POS_Y + 20*18);
 			GRRLIB_Screen2Texture(0, 0, screen_buffer, GX_FALSE); // Copy all status messages
 			GRRLIB_Render();
 			ClearScreen();
