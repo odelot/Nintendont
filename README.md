@@ -12,6 +12,14 @@
 > memory card connector, no soldering. This build uses the USB adapter when the loader finds one
 > and otherwise falls back to the original memory card Slot B link (details collapsed below).
 
+> **Wii U.** The same build runs on the Wii U in Wii mode (vWii); the wii-ra-adapter releases
+> ship a separate Wii U package. On the Wii U, play GameCube games from SD or USB (the drive
+> can't read GameCube discs) with a Bluetooth controller: a Wii Remote with a Classic Controller
+> (Pro), or a Wii U Pro Controller. The GamePad only works as a controller in a Wii VC inject,
+> which has not been tested with the adapter. USB GameCube controller adapters share the USB
+> stack with the RA adapter and have not been tested together either. See
+> [Wii U (vWii)](https://github.com/odelot/wii-ra-adapter#wii-u-vwii).
+
 ---
 
 ## What this fork adds
