@@ -54,6 +54,11 @@ static u32 link_tok = 0;
 static u8 small_out[288] __attribute__((aligned(32)));
 static u8 small_in[128]  __attribute__((aligned(32)));
 
+/* pipelined exchange state (RA_UsbLink_Post / _Reap) */
+static bool post_open = false;    /* posted, not reaped yet */
+static bool post_ready = false;   /* completed (by an Xfer meanwhile); result kept */
+static s32  post_res = 0;
+
 static struct {
 	bool busy;
 	bool out_done;
@@ -190,7 +195,15 @@ s32 RA_UsbLink_Xfer(const void *tx, u32 tx_len, void *rx, u32 rx_len, u32 skip, 
 
 	if (!link_up)
 		return RA_USBL_EDEAD;
-	/* A timed-out exchange finishes first (its late reply is dropped). */
+	/* A posted (pipelined) exchange finishes first and its reply is KEPT for
+	 * RA_UsbLink_Reap; a timed-out one finishes first and its late reply is
+	 * dropped. */
+	if (post_open && !post_ready) {
+		if (xs_wait(timeout_ms) < 0)
+			return RA_USBL_EBUSY;
+		post_res = xs_result();
+		post_ready = true;
+	}
 	if (xs_wait(timeout_ms) < 0)
 		return RA_USBL_EBUSY;
 
@@ -237,9 +250,56 @@ s32 RA_UsbLink_Xfer(const void *tx, u32 tx_len, void *rx, u32 rx_len, u32 skip, 
 	return 0;
 }
 
+s32 RA_UsbLink_Post(void *tx, u32 tx_len, void *rx, u32 rx_cap)
+{
+	u8 *out = (u8 *)tx;
+	u32 n = tx_len;
+	s32 r;
+
+	if (!link_up)
+		return RA_USBL_EDEAD;
+	if (xs.busy || post_open)
+		return RA_USBL_EBUSY;
+	if (tx_len > RA_USBL_TX_MAX || !dma_ok(tx, tx_len + 1) || !dma_ok(rx, rx_cap))
+		return RA_USBL_EBUF;
+	if ((n & 63u) == 0)
+		out[n++] = 0;
+	r = xs_post(out, n, rx, rx_cap);
+	if (r < 0)
+		return r;
+	post_open = true;
+	post_ready = false;
+	return 0;
+}
+
+s32 RA_UsbLink_Reap(u32 timeout_ms)
+{
+	s32 r;
+
+	if (!post_open)
+		return RA_USBL_EIDLE;
+	if (!post_ready) {
+		r = xs_wait(timeout_ms ? timeout_ms : 1);
+		if (r < 0)
+			return r;   /* RA_USBL_ETIMEOUT: still in flight */
+		post_res = xs_result();
+	}
+	post_open = false;
+	post_ready = false;
+	return post_res;
+}
+
+u32 RA_UsbLink_Posted(void)
+{
+	return post_open ? 1u : 0u;
+}
+
 #else /* !RA_USB_LINK */
 
 s32 RA_UsbLink_Init(void) { return RA_USBL_EDEAD; }
+s32 RA_UsbLink_Post(void *tx, u32 tx_len, void *rx, u32 rx_cap) { (void)tx; (void)tx_len; (void)rx; (void)rx_cap; return RA_USBL_EDEAD; }
+s32 RA_UsbLink_Reap(u32 timeout_ms) { (void)timeout_ms; return RA_USBL_EIDLE; }
+u32 RA_UsbLink_Posted(void) { return 0; }
 s32 RA_UsbLink_Xfer(const void *tx, u32 tx_len, void *rx, u32 rx_len, u32 skip, u32 timeout_ms)
 {
 	(void)tx; (void)tx_len; (void)rx; (void)rx_len; (void)skip; (void)timeout_ms;

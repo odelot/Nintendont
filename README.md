@@ -31,12 +31,14 @@ codehandler:
 | File | Purpose |
 |---|---|
 | `kernel/ra_module.c` / `ra_module.h` | The whole RA engine: pre-boot handshake, GameCube RA hash, link selection, watchlist state machine, pointer-chain walker, per-frame SNAPSHOT loop, video-retrace clock, unlock celebration. |
-| `kernel/ra_usb_link.c` / `ra_usb_link.h` | **USB link** (default): bulk exchanges with the adapter on the kernel's shared `/dev/usb/ven` handle (`USB_BlkMsgAsync`), with a timeout and the wire rules below. Twin of the d2x `usb_link.c`. |
+| `kernel/ra_usb_link.c` / `ra_usb_link.h` | **USB link** (default): bulk exchanges with the adapter on the kernel's shared `/dev/usb/ven` handle (`USB_BlkMsgAsync`), with a timeout and the wire rules below; blocking (`RA_UsbLink_Xfer`) or pipelined (`RA_UsbLink_Post` / `RA_UsbLink_Reap`). Twin of the d2x `usb_link.c`. |
+| `kernel/rappc/` | **PPC agent**: a small freestanding C + asm program for the Broadway, embedded in the kernel and installed in MEM2 at `0x93170000`. At every video retrace it reads the watched bytes and walks the pointer chains for the kernel (see *The PPC agent*). The shared memory layout is in `rappc_shared.h`. |
 | `loader/source/ra_usb_probe.c` + `common/include/RAUsbProbe.h` | **Loader hand-off**: with RA enabled, the PPC loader finds the adapter (VID:PID `303A:4052`) in the USB device list before closing its devices, writes the device id and endpoints to a hand-off block at `0x132C1100` for the kernel, then releases `/dev/usb/ven` (`RA_USBP_Release()`). |
-| `kernel/Patch.c` | Calls `RA_RetraceHook()` right after the codehandler is copied, to hook the game's video-retrace counter (see *Frame sync*). |
+| `kernel/Patch.c` | Calls `RA_RetraceHook()` right after the codehandler is copied, to hook the game's video-retrace handler (see *Frame sync*), and hands the free cheat area to `RA_SetFlushArea()` for the cache write-back list. |
 | `kernel/gc_ra_protocol.h` | Shared binary protocol (kept in sync with the copy in wii-ra-adapter). |
 | `kernel/main.c` | Two calls wired in: `RA_PreBootHandshake()` before the kernel signals the PPC loader it is ready, and `RA_Init()` before the kernel main loop. |
-| `codehandler/codehandleronly.s` | Per-frame hook: draws a 32×32 gold trophy badge when the flag at `0x1008` is set, and keeps a framebuffer-flip counter at `0x1004` (now only a fallback clock). |
+| `codehandler/codehandleronly.s` | Per-frame hook: draws a 32×32 gold trophy badge when the flag at `0x1008` is set, keeps a framebuffer-flip counter at `0x1004` (now only a fallback clock), and writes back (`dcbst`) the cache lines the kernel asks for (see *Cache coherency*). |
+| `loader/source/main.c` | Shows "RA: processing achievement data..." while the adapter prepares a large set (boot stage 17). |
 | `RA_PORT_PLAN.md` | The original feasibility analysis and porting plan from the Wii (d2x) implementation. |
 
 Unlike the Wii version (an IOS module in the d2x cIOS), there is no separate loader project and
@@ -62,7 +64,9 @@ identification:
    any game its database knows — no hardcoded game tables.
 4. Sends `LOAD_GAME` (game ID + hash) to the ESP32 and polls until it reports **GAME_LOADED**
    (the ESP32 is fetching the achievement set over Wi-Fi — up to ~90 s on a cold load), then
-   releases the boot. If the adapter is absent or errors, the game boots normally without RA.
+   releases the boot. While the ESP32 reports **PROCESSING** (`0x09`: parsing a large set, such as
+   Zelda: Collector's Edition) the wait restarts and the loader shows "RA: processing achievement
+   data...". If the adapter is absent or errors, the game boots normally without RA.
 
 ### Runtime: the kernel-side memory server
 
@@ -76,14 +80,20 @@ created high because IOS threads can only lower their own priority) that is a po
   returned (the reply read is posted first); no message is a multiple of 64 bytes (a `0x00` is
   appended, so a short packet ends it); replies arrive trimmed to a multiple of 4 and the ESP32
   pads them; a transfer may cross at most one 4 KB page (the Wii's OHCI does not split), so the
-  snapshot buffer is 4096-aligned and capped at 8191 bytes. GameCube snapshots are small
-  (~1–2 KB), so exchanges are synchronous — no pipelining needed. A timer token on the same
-  message queue bounds each wait; a timed-out exchange is finished before the next one starts.
+  snapshot buffer is 4096-aligned (in MEM2 at `0x931BE000`, outside the kernel `.bss`) and capped
+  at 8191 bytes. A timer token on the same message queue bounds each wait; a timed-out exchange
+  is finished before the next one starts.
+- **USB pipeline** (`RA_USB_PIPELINE`, default on) — the snapshot is put on the wire and the loop
+  goes back to waiting for the next retrace. The next fire first collects that reply, answers its
+  `ADDR_QUERY` rounds and any resync, and only then posts its own snapshot: the same message order
+  the ESP32 sees with a blocking exchange. A large snapshot (Majora's Mask: ~7.5 KB) no longer
+  holds the loop for the whole transfer. The memory card link stays blocking.
 - **Watchlist + chain walker** — fetches the watched-address list in chunks, then the Phase C
-  pointer-chain descriptor table; every frame it walks the chains in game RAM (with per-node
-  delta/prior histories, validity bitmaps and verification values — see the d2x fork README for
-  the full description), samples the flat watched bytes from MEM1, and ships everything in one
-  SNAPSHOT message (up to 8 KB).
+  pointer-chain descriptor table. Every frame the watched bytes are sampled and the chains walked
+  in game RAM (with per-node delta/prior histories, validity bitmaps and verification values —
+  see the d2x fork README for the full description), and everything ships in one SNAPSHOT message
+  (up to 8 KB). By default the **PPC agent** does the reading and walking (below); the kernel's own
+  Starlet walker is the fallback.
 - **Convergence** — drains up to 12 `ADDR_QUERY`/mutation rounds per frame, applying seq-verified
   watchlist appends/removals, exactly like the Wii module.
 - **Frame sync: the game's own video retrace** — emulators run one frame per video field
@@ -92,7 +102,12 @@ created high because IOS threads can only lower their own priority) that is a po
   `__VIRetraceHandler` (SDA base from `__init_registers`, an anchor on the VI register block, the
   `lwz`/`addi`/`stw` increment, confirmed by the `PreCB(retraceCount)` load that follows) and
   redirects that store through an 8-instruction stub at `0x1040` that also publishes the count
-  **uncached** at `0x1020` (a cached store would sit in Broadway's write-back cache). The kernel
+  **uncached** at `0x1020` (a cached store would sit in Broadway's write-back cache). With the PPC
+  agent, the handler's final `blr` (after `PreCB`, the frame-buffer flush and `PostCB`) branches
+  to an 11-instruction stub at `0x1068` instead, which calls the agent; the agent publishes the
+  count last. A step larger than 10 s of frames is a counter re-init (Zelda: Collector's Edition
+  restarts the SDK for each game), and the clock advances by wall time instead, so it never jumps
+  back. The kernel
   accepts it only after measuring 45–65 Hz for one second; from then on each snapshot is taken
   right after a retrace and numbered by it. If no hook is found, the rate is wrong, or the count
   stalls for 3 s, it falls back to the framebuffer-flip counter (trusted only after 30 advances)
@@ -102,6 +117,47 @@ created high because IOS threads can only lower their own priority) that is a po
   on-screen trophy badge blink 3× together (the kernel raises the flag at `0x1008`; the
   codehandler draws the badge into both framebuffers so it survives double buffering). Rumble is
   present but disabled.
+
+### The PPC agent
+
+The Starlet is shared: Nintendont's own emulation loop (hardware registers, controllers, memory
+cards) and the IOS take a good part of it every frame. Reading a few thousand watched bytes and
+walking ~1600 pointer chains there (Majora's Mask in Zelda: Collector's Edition), plus keeping MEM1
+coherent with Broadway's cache, did not fit in a 16.7 ms frame: the console sent ~47 snapshots/s.
+
+With `RA_PPC_AGENT` (default on) the Broadway does that work instead, once per video retrace:
+
+- **Code and data.** `kernel/rappc/` is built freestanding (no libc, no small-data, no FPU) and
+  linked at `0x93170000`, a MEM2 range Nintendont leaves free (`mem_map.txt`). The kernel
+  installs it when the game DOL loads. Shared blocks: CTL (written by the kernel), PST (written by
+  the agent), the flat address table, the chain table, three result slots, and a private stack.
+- **Where it runs.** At the end of the game's `__VIRetraceHandler`, after the game's callbacks
+  and the frame-buffer flush, so it never delays the flip. The game thread has not run since the
+  retrace, so the sample is exactly that frame's state, like an emulator.
+- **How it reads.** For each cache line it runs `dcbst` (writes back what the game wrote, never
+  allocates a line) and then loads through the cache-inhibited view, so the game's cache is left
+  untouched. A cached load inside the interrupt could leave a stale line in a buffer the game had
+  just invalidated for a disc read.
+- **Exactness.** The walk is a line-by-line mirror of the Starlet walker. Its delta/prior history
+  is the slot the ESP32 received last, so a skipped fire never shifts it. A writing/busy handshake
+  guards table updates, generation numbers and a "done" marker reject torn or stale slots, and a
+  fire that can't be built exactly is skipped and counted.
+- **Cost.** ~0.2–0.3 ms per frame on Melee and ~0.6 ms on Majora's Mask, on the Broadway. The
+  Starlet only copies the slot (Majora's Mask: 20.5 ms → 1.6 ms per fire, 60 snapshots/s).
+- **Fallbacks.** No recognisable handler exit: the agent is called from the `retraceCount` store.
+  A damaged image: the original stub comes back. 300 unusable fires in a row: off for the session,
+  back to the Starlet walker.
+
+The adapter log shows a `GC-RA ppc used= sk= tail= us= w= on hk=x` line every few seconds.
+
+### Cache coherency (Starlet path)
+
+Broadway's data cache is write-back. A hot working set that never leaves it (an NES emulator's
+RAM) leaves MEM1, which is what the Starlet reads, stale for the whole session. On the Starlet path
+the kernel records the 32-byte lines each snapshot read and publishes them as runs at
+`0x1060`/`0x1064` (in the free cheat area); the codehandler writes them back with `dcbst` on the
+next frame, so MEM1 holds current data. The PPC agent makes this unnecessary for everything it
+reads.
 
 <details>
 <summary><b>Memory card (EXI) link — legacy adapters</b></summary>
@@ -126,7 +182,13 @@ cache-coherency risk of reading game MEM1 from the ARM side, is in
 ## Building
 
 Same as upstream (see *Compiling* below; the `docker-build.sh` wrapper pins a working devkitPro
-image). The USB link is on by default (`RA_USB_LINK 1` in `common/include/RAUsbProbe.h`).
+image); the top-level Makefile builds `kernel/rappc` before the kernel. The USB link is on by
+default (`RA_USB_LINK 1` in `common/include/RAUsbProbe.h`). Toggles in `kernel/ra_module.h`:
+`RA_PPC_AGENT` and `RA_USB_PIPELINE` (both 1; 0 restores the previous behavior).
+
+> **Kernel memory:** the kernel boot stack (8 KB at `0x12FE0000`) grows down into the end of the
+> kernel `.bss`. Keep `__bss_end` well below `0x12FE0000` when adding kernel statics; large RA
+> buffers live in MEM2 instead.
 Pre-built binaries are published in the
 [wii-ra-adapter releases](https://github.com/odelot/wii-ra-adapter/releases).
 

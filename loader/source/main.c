@@ -1398,6 +1398,8 @@ int main(int argc, char **argv)
 				PrintFormat(DEFAULT_SIZE, BLACK, MENU_POS_X, MENU_POS_Y + 20*16, "RA: computing game hash... %33s", " ");
 			if(STATUS_LOADING == 15)
 				PrintFormat(DEFAULT_SIZE, BLACK, MENU_POS_X, MENU_POS_Y + 20*16, "RA: downloading achievement data... %24s", " ");
+			if(STATUS_LOADING == 17)   /* adapter parsing the downloaded set (RA_STATUS_PROCESSING) */
+				PrintFormat(DEFAULT_SIZE, BLACK, MENU_POS_X, MENU_POS_Y + 20*16, "RA: processing achievement data... %25s", " ");
 			if(STATUS_LOADING == 16)
 				PrintFormat(DEFAULT_SIZE, BLACK, MENU_POS_X, MENU_POS_Y + 20*16, "RA: achievements ready! %36s", " ");
 			if(STATUS_LOADING == -12)

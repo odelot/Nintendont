@@ -393,6 +393,87 @@ static u32 ra_watchlist[RA_MAX_WATCH] __attribute__((aligned(32)));
 static u16 ra_watch_count = 0;
 static u32 ra_frame_counter = 0;   /* delivery count (heartbeat/diag) */
 
+#if RA_PPC_AGENT
+/* ---- PPC agent (ra_module.h RA_PPC_AGENT; contract in rappc/rappc_shared.h) */
+#include "rappc/rappc_shared.h"
+#include "rappc/rappc.h"
+#define RA_PPC_FAIL_SKIPS 300u          /* consecutive unusable fires -> off for good */
+static int ra_ppc_ready = 0;            /* image installed + header valid */
+static int ra_ppc_failed = 0;           /* turned off for the session */
+static int ra_ppc_published = 0;        /* tables published + enable set */
+static int ra_ppc_was_on = 0;           /* last fire used the PPC slot */
+static u32 ra_ppc_entry_ea = 0;
+static u32 ra_ppc_ctl = 0, ra_ppc_pst = 0, ra_ppc_ftab = 0, ra_ppc_ntab = 0;   /* phys */
+static u32 ra_ppc_slot[RAPPC_NSLOT];
+static u32 ra_ppc_flat_gen = 0, ra_ppc_prefix_gen = 0, ra_ppc_chain_gen = 0;
+static u32 ra_ppc_committed = RAPPC_NO_SLOT;
+static u32 ra_ppc_dirty_from = 0xFFFFFFFFu;   /* lowest flat index changed (append) */
+static int ra_ppc_dirty_full = 1, ra_ppc_dirty_chain = 1;
+static u32 ra_ppc_cur = RAPPC_NO_SLOT;  /* slot the snapshot being built uses */
+static u32 ra_ppc_cur_seq = 0;
+static u32 ra_ppc_bad_run = 0;          /* consecutive unusable fires */
+/* diag (per window) */
+static u32 ra_ppc_used = 0, ra_ppc_sk_seq = 0, ra_ppc_sk_gen = 0, ra_ppc_sk_torn = 0,
+           ra_ppc_sk_hist = 0, ra_ppc_tail = 0, ra_ppc_ahead = 0, ra_ppc_lock_to = 0;
+static u32 ra_ppc_runs0 = 0, ra_ppc_tsum0 = 0, ra_ppc_skip0 = 0;
+
+static void ra_ppc_mark_full(void)  { ra_ppc_dirty_full = 1; }
+static void ra_ppc_mark_from(u32 i) { if (i < ra_ppc_dirty_from) ra_ppc_dirty_from = i; }
+
+/* Install the agent image into its MEM2 home (once per session). Called from
+ * RA_RetraceHook (DI thread, while the game's DOL loads) BEFORE the stub
+ * that calls it goes in. No ra_debug here (wrong thread for the link). */
+static int ra_ppc_install(void)
+{
+	const rappc_head_t *h = (const rappc_head_t *)RAPPC_BASE_PHYS;
+	u32 k;
+	if (ra_ppc_ready)
+		return 1;
+	if (ra_ppc_failed || rappc_size > RAPPC_AREA_SIZE)
+		return 0;
+	memcpy((void *)RAPPC_BASE_PHYS, rappc, rappc_size);
+	sync_after_write((void *)RAPPC_BASE_PHYS, (rappc_size + 31u) & ~31u);
+	/* the image must end before the snapshot buffer at the area's tail */
+	if (h->magic != RAPPC_MAGIC || h->version != RAPPC_VERSION ||
+	    h->slot_size != RAPPC_SLOT_SIZE ||
+	    h->image_end < RAPPC_BASE_EA + rappc_size ||
+	    h->image_end - RAPPC_BASE_EA > RA_SNAP_TX_PHYS - RAPPC_BASE_PHYS ||
+	    (h->entry >> 16) != (RAPPC_BASE_EA >> 16)) {
+		ra_ppc_failed = 1;
+		return 0;
+	}
+	/* zero the agent's .bss only (never the snapshot buffer) */
+	memset((void *)(RAPPC_BASE_PHYS + rappc_size), 0, h->image_end - RAPPC_BASE_EA - rappc_size);
+	sync_after_write((void *)RAPPC_BASE_PHYS, h->image_end - RAPPC_BASE_EA);
+	ra_ppc_entry_ea = h->entry;
+	ra_ppc_ctl  = h->ctl      & 0x1FFFFFFFu;
+	ra_ppc_pst  = h->pst      & 0x1FFFFFFFu;
+	ra_ppc_ftab = h->flat_tab & 0x1FFFFFFFu;
+	ra_ppc_ntab = h->node_tab & 0x1FFFFFFFu;
+	for (k = 0; k < RAPPC_NSLOT; k++)
+		ra_ppc_slot[k] = h->slot[k] & 0x1FFFFFFFu;
+	{
+		rappc_ctl_t *c = (rappc_ctl_t *)ra_ppc_ctl;
+		rappc_pst_t *p = (rappc_pst_t *)ra_ppc_pst;
+		c->magic = RAPPC_MAGIC;
+		c->committed = RAPPC_NO_SLOT;
+		p->latest = RAPPC_NO_SLOT;
+		sync_after_write((void *)ra_ppc_ctl, sizeof(rappc_ctl_t));
+		sync_after_write((void *)ra_ppc_pst, sizeof(rappc_pst_t));
+	}
+	ra_ppc_ready = 1;
+	return 1;
+}
+
+/* the game's retraceCount EA, read by the agent (and published at 0x1020) */
+static void ra_ppc_set_rt_ea(u32 ea)
+{
+	rappc_ctl_t *c = (rappc_ctl_t *)ra_ppc_ctl;
+	c->rt_count_ea = ea;
+	sync_after_write((void *)ra_ppc_ctl, sizeof(rappc_ctl_t));
+}
+#endif
+
 /* Frame clock shipped in the SNAPSHOT header so the ESP's rc_client_do_frame
  * debt catch-up advances at the right rate.
  *
@@ -422,6 +503,14 @@ static int ra_vbi_live  = 0;   /* 1 once the counter has advanced RA_VBI_LIVE_AD
  * and drop back to the wall clock for good if a live counter stalls. */
 #define RA_VBI_LIVE_ADV  30u   /* advances needed before trusting the counter */
 #define RA_VBI_STALL_HW  180u  /* hw frames (~3 s) without an advance = dead */
+/* A per-loop step of a game-side counter (retrace / VBI) larger than this is
+ * not elapsed time: the counter was re-initialised. Zelda Collector's Edition
+ * (2026-11-15) reboots the SDK when a sub-game starts, retraceCount restarts
+ * at 0 and the u32 delta wrapped -> the frame clock jumped back ~115 frames
+ * (gf=4294967181), firing the ESP's periodic GC and garbling its stats. On
+ * such a step, advance by the wall clock instead: the clock stays monotonic. */
+#define RA_CLOCK_MAX_STEP 600u  /* 10 s of frames */
+static u32 ra_clock_resets = 0;   /* counter re-inits absorbed (diag) */
 static u32 ra_vbi_adv     = 0; /* advances seen while not yet live */
 static u32 ra_vbi_last_hw = 0; /* hw_frame of the last advance */
 static int ra_vbi_dead    = 0; /* 1 = counter judged dead, wall clock for good */
@@ -446,7 +535,14 @@ enum { RT_OFF = 0, RT_PROBING, RT_LIVE, RT_DEAD };
 static u32 ra_rt_target   = 0;   /* phys addr of the hooked `stw rY,d(r13)` (0 = none) */
 static u32 ra_rt_orig     = 0;   /* its original instruction */
 static u32 ra_rt_count_ea = 0;   /* the game's retraceCount address (diag) */
-static u32 ra_rt_stub[8];
+static u32 ra_rt_stub[11];
+/* where the stub lives and which game instruction branches to it: the
+ * retraceCount++ store (count-only stub, 8 words at RA_RETRACE_STUB_PHYS), or
+ * — PPC agent — the handler's final blr (11 words at RA_RETRACE_EXIT_STUB_PHYS) */
+static u32 ra_rt_hook_at   = 0;
+static u32 ra_rt_hook_orig = 0;
+static u32 ra_rt_stub_at   = RA_RETRACE_STUB_PHYS;
+static u32 ra_rt_stub_n    = 8;
 static int ra_rt_state    = RT_OFF;
 static u32 ra_rt_last     = 0;   /* last retrace count read */
 static u32 ra_rt_last_hw  = 0;   /* hw_frame of the last retrace advance */
@@ -465,11 +561,54 @@ static u32 ra_rt_branch(u32 from, u32 to)
 static void ra_rt_install(void)
 {
 	u32 k;
-	for (k = 0; k < 8; k++)
-		write32(RA_RETRACE_STUB_PHYS + k * 4, ra_rt_stub[k]);
-	sync_after_write((void*)RA_RETRACE_STUB_PHYS, 0x20);
-	write32(ra_rt_target, ra_rt_branch(ra_rt_target, RA_RETRACE_STUB_PHYS));
-	sync_after_write((void*)(ra_rt_target & ~0x1Fu), 0x20);
+	for (k = 0; k < ra_rt_stub_n; k++)
+		write32(ra_rt_stub_at + k * 4, ra_rt_stub[k]);
+	sync_after_write((void*)(ra_rt_stub_at & ~0x1Fu), ((ra_rt_stub_at & 0x1Fu) + ra_rt_stub_n * 4 + 31u) & ~0x1Fu);
+	write32(ra_rt_hook_at, ra_rt_branch(ra_rt_hook_at, ra_rt_stub_at));
+	sync_after_write((void*)(ra_rt_hook_at & ~0x1Fu), 0x20);
+}
+
+/* The 8-word count-only stub on the retraceCount++ store t (the original
+ * mechanism, also the PPC agent's fallback when no exit is found). */
+static void ra_rt_stub_count(u32 t)
+{
+	u32 ry = (ra_rt_orig >> 21) & 31, rt = (ry == 12) ? 11 : 12;
+	ra_rt_hook_at   = t;
+	ra_rt_hook_orig = ra_rt_orig;
+	ra_rt_stub_at   = RA_RETRACE_STUB_PHYS;
+	ra_rt_stub_n    = 8;
+	ra_rt_stub[0] = ra_rt_orig;                                   /* stw rY, d(r13)        */
+	ra_rt_stub[1] = 0x9421FFF0u;                                  /* stwu r1, -16(r1)       */
+	ra_rt_stub[2] = 0x90010008u | (rt << 21);                     /* stw rT, 8(r1)          */
+	ra_rt_stub[3] = 0x3C00C000u | (rt << 21);                     /* lis rT, 0xC000         */
+	ra_rt_stub[4] = 0x90000000u | (ry << 21) | (rt << 16) | RA_RETRACE_SLOT_PHYS; /* stw rY, slot(rT) */
+	ra_rt_stub[5] = 0x80010008u | (rt << 21);                     /* lwz rT, 8(r1)          */
+	ra_rt_stub[6] = 0x38210010u;                                  /* addi r1, r1, 16        */
+	ra_rt_stub[7] = ra_rt_branch(RA_RETRACE_STUB_PHYS + 28, t + 4); /* b back               */
+}
+
+/* The handler's exit after the retraceCount++ store t: the first blr, which
+ * must look like the function epilogue (mtlr r0 + a stack pop in the 8 words
+ * before it). Gives up on anything else — a prologue (next function), an
+ * unexpected blr — and the caller falls back to the store hook. */
+static u32 ra_rt_find_exit(u32 t, u32 end)
+{
+	u32 a, lim = t + 0x800u;
+	if (lim > end) lim = end;
+	for (a = t + 4; a + 4 <= lim; a += 4) {
+		u32 w = read32(a), k, mt = 0, pop = 0;
+		if (w == 0x7C0802A6u || (w & 0xFFFF8000u) == 0x94218000u)   /* mflr r0 / stwu r1,-N(r1) */
+			return 0;
+		if (w != 0x4E800020u)                                        /* blr */
+			continue;
+		for (k = 1; k <= 8 && a - k * 4 > t; k++) {
+			u32 p = read32(a - k * 4);
+			if (p == 0x7C0803A6u) mt = 1;                            /* mtlr r0 */
+			if ((p & 0xFFFF8000u) == 0x38210000u || p == 0x80210000u) pop = 1;   /* addi r1,r1,N / lwz r1,0(r1) */
+		}
+		return (mt && pop) ? a : 0;
+	}
+	return 0;
 }
 
 /* Is the word at i an anchor of the VI register block (0xCC002000)?
@@ -543,8 +682,11 @@ void RA_RetraceHook(u32 buf, u32 len)
 	u32 i, end = buf + len, sda = 0, t, d = 0, ry, rt;
 
 	if (ra_rt_target) {
-		u32 cur = read32(ra_rt_target);
-		if (cur == ra_rt_orig || cur == ra_rt_branch(ra_rt_target, RA_RETRACE_STUB_PHYS)) {
+		u32 cur = read32(ra_rt_hook_at);
+		int same = (cur == ra_rt_hook_orig || cur == ra_rt_branch(ra_rt_hook_at, ra_rt_stub_at));
+		if (same && ra_rt_hook_at != ra_rt_target)   /* exit hook: the store must be intact too */
+			same = (read32(ra_rt_target) == ra_rt_orig);
+		if (same) {
 			ra_rt_install();   /* same game: restore the stub the copy just wiped */
 			return;
 		}
@@ -575,14 +717,55 @@ void RA_RetraceHook(u32 buf, u32 len)
 	ra_rt_orig = read32(t);
 	ry = (ra_rt_orig >> 21) & 31;
 	rt = (ry == 12) ? 11 : 12;                      /* scratch register, saved */
-	ra_rt_stub[0] = ra_rt_orig;                                   /* stw rY, d(r13)        */
-	ra_rt_stub[1] = 0x9421FFF0u;                                  /* stwu r1, -16(r1)       */
-	ra_rt_stub[2] = 0x90010008u | (rt << 21);                     /* stw rT, 8(r1)          */
-	ra_rt_stub[3] = 0x3C00C000u | (rt << 21);                     /* lis rT, 0xC000         */
-	ra_rt_stub[4] = 0x90000000u | (ry << 21) | (rt << 16) | RA_RETRACE_SLOT_PHYS; /* stw rY, slot(rT) */
-	ra_rt_stub[5] = 0x80010008u | (rt << 21);                     /* lwz rT, 8(r1)          */
-	ra_rt_stub[6] = 0x38210010u;                                  /* addi r1, r1, 16        */
-	ra_rt_stub[7] = ra_rt_branch(RA_RETRACE_STUB_PHYS + 28, t + 4); /* b back               */
+#if RA_PPC_AGENT
+	/* PPC agent: the stub calls it (rappc/ra_ppc_entry.S); it walks, then
+	 * publishes the count at RA_RETRACE_SLOT_PHYS itself. LR is dead here
+	 * (the handler saved it and calls PreCB next), so blrl may use it. */
+	if (ra_ppc_install()) {
+		/* PREFERRED: the handler's exit — after PreCB, the frame-buffer flush
+		 * and PostCB, so the agent never delays the flip (from the store, its
+		 * time pushed Melee past the vblank window: 60 -> 30 fps, 2026-11-15).
+		 * The game's thread has not run since the retrace: same frame state. */
+		u32 x = ra_rt_find_exit(t, end);
+		ra_ppc_set_rt_ea(ra_rt_count_ea);
+		ra_rt_target = t;
+		if (x) {
+			ra_rt_hook_at   = x;
+			ra_rt_hook_orig = read32(x);
+			ra_rt_stub_at   = RA_RETRACE_EXIT_STUB_PHYS;
+			ra_rt_stub_n    = 11;
+			ra_rt_stub[0]  = 0x9421FFF0u;                               /* stwu r1, -16(r1)       */
+			ra_rt_stub[1]  = 0x90010008u;                               /* stw r0, 8(r1)          */
+			ra_rt_stub[2]  = 0x7C0802A6u;                               /* mflr r0                */
+			ra_rt_stub[3]  = 0x9001000Cu;                               /* stw r0, 12(r1)         */
+			ra_rt_stub[4]  = 0x3C000000u | (ra_ppc_entry_ea >> 16);     /* lis r0, entry@h        */
+			ra_rt_stub[5]  = 0x60000000u | (ra_ppc_entry_ea & 0xFFFFu); /* ori r0, r0, entry@l    */
+			ra_rt_stub[6]  = 0x7C0803A6u;                               /* mtlr r0                */
+			ra_rt_stub[7]  = 0x4E800021u;                               /* blrl (pops r0 + frame) */
+			ra_rt_stub[8]  = 0x8001FFFCu;                               /* lwz r0, -4(r1): saved LR */
+			ra_rt_stub[9]  = 0x7C0803A6u;                               /* mtlr r0                */
+			ra_rt_stub[10] = 0x4E800020u;                               /* blr (the original)     */
+			ra_rt_install();
+			return;
+		}
+		ra_rt_hook_at   = t;
+		ra_rt_hook_orig = ra_rt_orig;
+		ra_rt_stub_at   = RA_RETRACE_STUB_PHYS;
+		ra_rt_stub_n    = 8;
+		ra_rt_stub[0] = ra_rt_orig;                               /* stw rY, d(r13)         */
+		ra_rt_stub[1] = 0x9421FFF0u;                              /* stwu r1, -16(r1)       */
+		ra_rt_stub[2] = 0x90010008u;                              /* stw r0, 8(r1)          */
+		ra_rt_stub[3] = 0x3C000000u | (ra_ppc_entry_ea >> 16);     /* lis r0, entry@h        */
+		ra_rt_stub[4] = 0x60000000u | (ra_ppc_entry_ea & 0xFFFFu); /* ori r0, r0, entry@l    */
+		ra_rt_stub[5] = 0x7C0803A6u;                              /* mtlr r0                */
+		ra_rt_stub[6] = 0x4E800021u;                              /* blrl (pops r0 + frame) */
+		ra_rt_stub[7] = ra_rt_branch(RA_RETRACE_STUB_PHYS + 28, t + 4); /* b back           */
+		ra_rt_install();
+		return;
+	}
+#endif
+	(void)ry; (void)rt;
+	ra_rt_stub_count(t);
 	ra_rt_target = t;
 	ra_rt_install();
 }
@@ -611,12 +794,18 @@ static u8  ra_ach_fired = 0;
 /* Page-aligned for the USB link: one transfer may cross only ONE 4 KB page
  * boundary (OHCI), and on USB the window budget stops one byte short of 8192
  * (an 8192-byte message would get a framing pad) — see ra_snap_budget(). */
-static u8 ra_snap_tx[8192]        __attribute__((aligned(4096)));
+/* (2026-11-15) NOT in the kernel .bss any more: page-aligned 8 KB there could
+ * waste up to 4 KB of padding and leave the kernel boot stack (8 KB at
+ * 0x12FE0000, growing down into the end of .bss) with no margin — a build that
+ * grew a few hundred bytes hung Nintendont at start, black screen. It lives at
+ * the end of the RA MEM2 area (rappc_shared.h), past the PPC agent image,
+ * touched only by the Starlet. */
+static u8 *const ra_snap_tx = (u8 *)RA_SNAP_TX_PHYS;
 static u8 ra_snap_rx[RA_RESP_LEN] __attribute__((aligned(32)));
 
 static u32 ra_snap_budget(void)
 {
-	return ra_usb ? RA_USBL_TX_MAX : sizeof(ra_snap_tx);
+	return ra_usb ? RA_USBL_TX_MAX : RA_SNAP_TX_SIZE;
 }
 /* GET_CHUNK response via Phase B: 6(FF pad)+6(esp_hdr)+hdr+payload.
  *   watchlist: 6 + 6 + 6 + 1024×4 = 4114
@@ -696,11 +885,171 @@ static u16 ra_chain_dp_count = 0;
  * Clamp to the real 24 MB window: a stray watchlist address beyond MEM1 (e.g.
  * garbage from a bad chunk) would otherwise read 0x81800000+ and data-abort
  * the kernel. 32-bit aligned read + big-endian byte extract. */
+/* STARLET CACHE REFRESH (2026-11-15, TEST — Zelda Collector's Edition).
+ * The note above assumed the snapshot reads thrash the D-cache. They don't when
+ * the watched set is small and the same every frame: Zelda 1's NES RAM (the
+ * zero page with the level byte, hearts, rupees) read the SAME bytes for the
+ * whole session (the RAM-init fill pattern 7d fe ef 0f) while the game ran, so
+ * "Listen to Your Elders" (level == 0) never fired. Each 32-byte line is now
+ * written back THEN invalidated (clean first: a line the DI thread has dirtied is
+ * stored, never discarded — the boot-freeze hazard above) once per snapshot
+ * before its first read, so the read comes from MEM1. Off until the snapshot loop
+ * runs (epoch 0 = boot: no cache maintenance while DI loads the game).
+ * Dedupe table is direct-mapped (a collision only costs an extra sync). If MEM1
+ * still reads stale after this, the stale copy is in the PPC's write-back cache
+ * (step 2: dcbst from the retrace hook). */
+/* Dedupe table, direct-mapped, one packed word per slot (2026-11-15: 256 slots
+ * collided constantly with Majora's ~580 lines/frame):
+ *   bits 31..12 = line index (MEM1 offset >> 5, < 2^20)
+ *   bits 11..1  = epoch (11 bits; the table is wiped when it wraps)
+ *   bit 0       = PRE: refreshed by the run pre-pass, not yet read this epoch */
+#define RA_FRESH_SLOTS 1024u
+#define RA_FRESH_EP_MASK 0x7FFu
+static u32 ra_fresh_tab[RA_FRESH_SLOTS];
+static u32 ra_fresh_epoch = 0;   /* 0 = off; 1..RA_FRESH_EP_MASK */
+static u32 ra_fresh_syncs = 0;   /* lines refreshed (diag, cumulative) */
+
+/* PPC WRITE-BACK LIST (step 2). Step 1 alone did NOT cure Zelda CE: the stale
+ * copy is in the PPC's write-back cache, which the Starlet cannot reach. Each
+ * line refreshed for a snapshot is recorded; the next snapshot publishes the
+ * list (cached EAs) in the zeroed cheats area + its uncached address and count
+ * at 0x1060/0x1064 (cheatdata scratch, unused without a GCT); the codehandler
+ * (once per frame) dcbst's them. Kept at the LOW end of the area, well clear of
+ * the patch area that PatchCopy grows downward. */
+#define RA_WB_SLOT_LIST_PHYS   0x1060u   /* u32: uncached EA of the list (0 = none) */
+#define RA_WB_SLOT_COUNT_PHYS  0x1064u   /* u32: entries */
+#define RA_WB_MAX              512u      /* list ENTRIES (runs) = the codehandler's sanity cap */
+#define RA_WB_GAP              3u        /* PPC runs may bridge up to 3 unread lines */
+#define RA_WB_REC_MAX          1024u     /* lines recorded per snapshot (Majora: ~500) */
+#define RA_WB_MARGIN           0x400u    /* bytes kept free below the patch area */
+static u32 ra_wb_list_phys = 0, ra_wb_cap = 0;
+static u32 ra_wb_lines[RA_WB_REC_MAX];
+static u32 ra_snap_t_sum = 0, ra_snap_t_max = 0, ra_snap_t_n = 0;   /* snapshot build+send time (HW_TIMER ticks) */
+/* per-phase sums (ticks): publish+pre-pass, flat values, chain walk, build, transfer */
+static u32 ra_ph_pub = 0, ra_ph_val = 0, ra_ph_chn = 0, ra_ph_bld = 0, ra_ph_xfr = 0;
+static u32 ra_wb_n = 0, ra_wb_pub = 0;   /* recorded this snapshot / last published */
+
+void RA_SetFlushArea(u32 lo, u32 hi)
+{
+	ra_wb_list_phys = 0;
+	ra_wb_cap = 0;
+	ra_wb_n = 0;
+	write32(RA_WB_SLOT_COUNT_PHYS, 0);
+	write32(RA_WB_SLOT_LIST_PHYS, 0);
+	sync_after_write((void *)(RA_WB_SLOT_LIST_PHYS & ~0x1Fu), 0x20);
+	lo = (lo + 31u) & ~31u;
+	if (lo && hi > lo + RA_WB_MARGIN) {
+		u32 cap = (hi - lo - RA_WB_MARGIN) / 4u;
+		if (cap > RA_WB_MAX) cap = RA_WB_MAX;
+		if (cap >= 32u) {
+			ra_wb_list_phys = lo;
+			ra_wb_cap = cap;
+		}
+	}
+}
+
+/* publish the lines the previous snapshot read; called at the start of the next.
+ * 2026-11-15: as RUNS — sorted, deduped, consecutive lines merged into one entry
+ * (EA | lines-1, max 32 lines). Majora's Mask read ~500 lines/frame and the flat
+ * 256-entry list left half of them stale (wb=256/256). */
+static u32 ra_wb_lines_pub = 0;   /* lines covered by the published runs (diag) */
+static void ra_wb_publish(void)
+{
+	u32 i, n = ra_wb_n, runs = 0, covered = 0, gap;
+	static const u32 gaps[] = { 701, 301, 132, 57, 23, 10, 4, 1 };   /* Ciura */
+	ra_wb_n = 0;
+	if (!ra_wb_list_phys)
+		return;
+	/* Shell sort (n <= 1024: ~10K compares, no recursion on the Starlet stack) */
+	for (gap = 0; gap < sizeof(gaps) / sizeof(gaps[0]); gap++) {
+		u32 g = gaps[gap], j;
+		for (i = g; i < n; i++) {
+			u32 v = ra_wb_lines[i];
+			for (j = i; j >= g && ra_wb_lines[j - g] > v; j -= g)
+				ra_wb_lines[j] = ra_wb_lines[j - g];
+			ra_wb_lines[j] = v;
+		}
+	}
+	/* dedupe in place (sorted) */
+	if (n) {
+		u32 w = 1;
+		for (i = 1; i < n; i++)
+			if (ra_wb_lines[i] != ra_wb_lines[w - 1]) ra_wb_lines[w++] = ra_wb_lines[i];
+		n = w;
+	}
+	/* STARLET pre-pass: the lines read last snapshot are (nearly) the lines read
+	 * now. Refresh them by EXACT run (consecutive lines only — the same set the
+	 * per-line path would touch, never a line that wasn't read) with one clean +
+	 * one invalidate per run instead of per line, and pre-mark them (PRE) so the
+	 * read path skips its own sync. Epoch: the NEXT one (ra_send_snapshot bumps
+	 * it right after this). A line no longer read simply isn't recorded again. */
+	{
+		u32 ne = (ra_fresh_epoch >= RA_FRESH_EP_MASK) ? 1u : ra_fresh_epoch + 1u;   /* (wrap wipe: ra_send_snapshot) */
+		for (i = 0; i < n; ) {
+			u32 first = ra_wb_lines[i], len = 1, k;
+			i++;
+			while (i < n && ra_wb_lines[i] == first + 32u * len) { len++; i++; }
+			sync_after_write((void *)first, 32u * len);
+			sync_before_read((void *)first, 32u * len);
+			for (k = 0; k < len; k++) {
+				u32 ln = first + 32u * k;
+				ra_fresh_tab[(ln >> 5) & (RA_FRESH_SLOTS - 1u)] = ((ln >> 5) << 12) | (ne << 1) | 1u;
+			}
+			ra_fresh_syncs += len;
+		}
+	}
+	write32(RA_WB_SLOT_COUNT_PHYS, 0);            /* PPC sees 0 while the list changes */
+	sync_after_write((void *)(RA_WB_SLOT_LIST_PHYS & ~0x1Fu), 0x20);
+	/* PPC runs: may bridge small gaps (dcbst of an unread line is harmless: it
+	 * only writes back what the PPC already holds; a clean line costs nothing) */
+	for (i = 0; i < n && runs < ra_wb_cap; ) {
+		u32 first = ra_wb_lines[i], len = 1;
+		i++;
+		while (i < n) {
+			u32 next = ra_wb_lines[i];
+			u32 span = (next - first) / 32u + 1u;   /* lines first..next */
+			if (span > 32u || span > len + RA_WB_GAP + 1u) break;
+			len = span;
+			i++;
+		}
+		write32(ra_wb_list_phys + 4u * runs, (0x80000000u | first) | (len - 1u));
+		runs++;
+		covered += len;
+	}
+	if (runs)
+		sync_after_write((void *)ra_wb_list_phys, (4u * runs + 31u) & ~31u);
+	write32(RA_WB_SLOT_LIST_PHYS, 0xC0000000u | ra_wb_list_phys);
+	write32(RA_WB_SLOT_COUNT_PHYS, runs);
+	sync_after_write((void *)(RA_WB_SLOT_LIST_PHYS & ~0x1Fu), 0x20);
+	ra_wb_pub = runs;
+	ra_wb_lines_pub = covered;
+}
+
+static void ra_fresh_line_sync(u32 off)
+{
+	u32 line = off & ~0x1Fu;
+	u32 slot = (line >> 5) & (RA_FRESH_SLOTS - 1u);
+	u32 tag = ((line >> 5) << 12) | (ra_fresh_epoch << 1);
+	u32 cur = ra_fresh_tab[slot];
+	if (cur == tag)
+		return;                                   /* already refreshed + recorded this epoch */
+	ra_fresh_tab[slot] = tag;
+	if (cur != (tag | 1u)) {                      /* not pre-refreshed by the run pass */
+		sync_after_write((void *)line, 0x20);     /* write back anything the Starlet dirtied */
+		sync_before_read((void *)line, 0x20);     /* ... then drop the stale copy */
+		ra_fresh_syncs++;
+	}
+	if (ra_wb_list_phys && ra_wb_n < RA_WB_REC_MAX)
+		ra_wb_lines[ra_wb_n++] = line;            /* ask the PPC to write it back next frame */
+}
+
 static u8 ra_read_mem1(u32 addr)
 {
 	u32 off = addr & 0x01FFFFFFu;
 	u32 w;
 	if (off >= 0x01800000u) return 0;          /* outside GC MEM1 — skip safely */
+	if (ra_fresh_epoch)
+		ra_fresh_line_sync(off);
 	/* MEM1 is at PHYSICAL 0-based from the Starlet (Nintendont's P2C macro =
 	 * &0x7FFFFFFF strips the 0x80000000 Broadway cached-view bit before any
 	 * MEM1 access; the canonical Wii ra-module also reads 0-based). Reading
@@ -907,6 +1256,9 @@ static int ra_fetch_watchlist(void)
 	u16 idx = 0;
 	int ret;
 	ra_watch_count = 0;
+#if RA_PPC_AGENT
+	ra_ppc_mark_full();
+#endif
 	while (idx < 32) {
 		ret = ra_fetch_watchlist_chunk(idx);
 		if (ret < 0) return ret;
@@ -986,6 +1338,9 @@ static void ra_fetch_chain_table(void)
 	ra_chain_node_count = 0;
 	ra_chain_shipped    = 0;
 	ra_chain_win_next   = 0;
+#if RA_PPC_AGENT
+	ra_ppc_dirty_chain  = 1;
+#endif
 
 	while (chunk_idx < (RA_GC_CHAIN_NODES / RA_CHAIN_CHUNK_NODES) + 1) {
 		ret = ra_fetch_chain_chunk(chunk_idx, &base);
@@ -1084,6 +1439,9 @@ static void ra_parse_response(const u8 *buf)
 			/* UNIFY: append the queried addrs to the watchlist now (the ESP
 			 * does the same on ADDR_RESPONSE — kept in lockstep). */
 			if ((u32)ra_watch_count + aq.addr_count <= RA_MAX_WATCH) {
+#if RA_PPC_AGENT
+				ra_ppc_mark_from(ra_watch_count);
+#endif
 				for (j = 0; j < aq.addr_count; j++)
 					ra_watchlist[ra_watch_count + j] = ra_pending_q[j];
 				ra_watch_count += aq.addr_count;
@@ -1097,6 +1455,9 @@ static void ra_parse_response(const u8 *buf)
 		    && (u32)ra_watch_count + wa.addr_count <= RA_MAX_WATCH) {
 			const u8 *src = buf + sizeof(resp) + sizeof(wa);
 			u16 j;
+#if RA_PPC_AGENT
+			ra_ppc_mark_from(ra_watch_count);
+#endif
 			for (j = 0; j < wa.addr_count; j++)
 				memcpy(&ra_watchlist[ra_watch_count + j], src + j * 4, 4);
 			ra_watch_count += wa.addr_count;
@@ -1109,6 +1470,9 @@ static void ra_parse_response(const u8 *buf)
 		    && wri.idx_count > 0 && wri.idx_count <= ra_watch_count) {
 			const u8 *src = buf + sizeof(resp) + sizeof(wri);
 			u16 i, skip = 0, w = 0;
+#if RA_PPC_AGENT
+			ra_ppc_mark_full();   /* indices move: this fire can't use the slot */
+#endif
 			for (i = 0; i < ra_watch_count; i++) {
 				if (skip < wri.idx_count) {
 					u16 idx; memcpy(&idx, src + skip * 2, 2);
@@ -1140,6 +1504,191 @@ static void ra_parse_response(const u8 *buf)
 #define RA_SNAP_TEST_CAP   0    /* 0 = full watchlist (diagnostic isolation off) */
 #define RA_SNAP_TEST_READ  0    /* 0 = full RA_RESP_LEN read */
 
+#if RA_PPC_AGENT
+/* Image no longer ours: put the original retraceCount stub back (count publish
+ * only) so the PPC stops calling into it, and stay on the Starlet path. */
+static void ra_ppc_drop_stub(void)
+{
+#if RA_USE_RETRACE
+	if (ra_rt_target) {
+		if (ra_rt_hook_at != ra_rt_target) {   /* exit hook: put the blr back first */
+			write32(ra_rt_hook_at, ra_rt_hook_orig);
+			sync_after_write((void*)(ra_rt_hook_at & ~0x1Fu), 0x20);
+		}
+		ra_rt_stub_count(ra_rt_target);
+		ra_rt_install();
+	}
+#endif
+	ra_ppc_failed = 1;
+	ra_ppc_ready = 0;
+}
+
+static int ra_ppc_on(void)
+{
+	return ra_ppc_ready && !ra_ppc_failed && ra_ppc_published
+#if RA_USE_RETRACE
+	       && ra_rt_state == RT_LIVE
+#endif
+	       ;
+}
+
+/* Exclusion vs the agent's walk (rappc_shared.h): raise CTL.writing, then wait
+ * until PST.busy drops (a walk is well under 1 ms). */
+static void ra_ppc_lock(void)
+{
+	rappc_ctl_t *c = (rappc_ctl_t *)ra_ppc_ctl;
+	rappc_pst_t *p = (rappc_pst_t *)ra_ppc_pst;
+	u32 t0;
+	c->writing = 1;
+	sync_after_write((void *)ra_ppc_ctl, sizeof(rappc_ctl_t));
+	t0 = read32(HW_TIMER);
+	for (;;) {
+		sync_before_read((void *)ra_ppc_pst, sizeof(rappc_pst_t));
+		if (!p->busy)
+			return;
+		if (read32(HW_TIMER) - t0 > 3800u) {   /* 2 ms: proceed (gens catch a race) */
+			ra_ppc_lock_to++;
+			return;
+		}
+	}
+}
+
+static void ra_ppc_unlock(void)
+{
+	rappc_ctl_t *c = (rappc_ctl_t *)ra_ppc_ctl;
+	c->writing = 0;
+	sync_after_write((void *)ra_ppc_ctl, sizeof(rappc_ctl_t));
+}
+
+/* After a fire: publish every list/table change since the last one and, when
+ * the snapshot that used slot 'commit' went out, make it the walk history. */
+static void ra_ppc_after(u32 commit)
+{
+	rappc_ctl_t *c = (rappc_ctl_t *)ra_ppc_ctl;
+	int flat = ra_ppc_dirty_full || ra_ppc_dirty_from != 0xFFFFFFFFu;
+	if (!ra_ppc_ready || ra_ppc_failed)
+		return;
+	if (!flat && !ra_ppc_dirty_chain && commit == RAPPC_NO_SLOT && ra_ppc_published)
+		return;
+	ra_ppc_lock();
+	if (flat) {
+		u32 from = ra_ppc_dirty_full ? 0u : ra_ppc_dirty_from;
+		u32 n = ra_watch_count;
+		if (from > n) from = n;
+		if (n > from) {
+			memcpy((void *)(ra_ppc_ftab + from * 4u), &ra_watchlist[from], (n - from) * 4u);
+			sync_after_write((void *)(ra_ppc_ftab + from * 4u), (n - from) * 4u);
+		}
+		c->flat_count = n;
+		c->flat_gen = ++ra_ppc_flat_gen;
+		if (ra_ppc_dirty_full)
+			ra_ppc_prefix_gen = ra_ppc_flat_gen;
+		ra_ppc_dirty_full = 0;
+		ra_ppc_dirty_from = 0xFFFFFFFFu;
+	}
+	if (ra_ppc_dirty_chain) {
+		u32 n = ra_chain_node_count;
+		if (n) {
+			memcpy((void *)ra_ppc_ntab, ra_chain_nodes, n * 8u);
+			sync_after_write((void *)ra_ppc_ntab, n * 8u);
+		}
+		c->node_count = n;
+		c->chain_gen = ++ra_ppc_chain_gen;
+		c->committed = RAPPC_NO_SLOT;          /* new table: no history */
+		ra_ppc_committed = RAPPC_NO_SLOT;
+		ra_ppc_dirty_chain = 0;
+		commit = RAPPC_NO_SLOT;
+	}
+	if (commit != RAPPC_NO_SLOT) {
+		c->committed = commit;
+		ra_ppc_committed = commit;
+	}
+	c->magic = RAPPC_MAGIC;                    /* re-assert (see rappc.c first run) */
+#if RA_USE_RETRACE
+	c->rt_count_ea = ra_rt_count_ea;
+#endif
+	c->enable = 1;
+	ra_ppc_published = 1;
+	ra_ppc_unlock();
+}
+
+/* Fill vals[] (and point the chain section at the slot) from the agent's
+ * newest walk. 1 = used, 0 = agent not in use (Starlet path), -1 = this fire
+ * can't be built exactly (skip it). */
+static int ra_ppc_take(u8 *vals, u16 count)
+{
+	rappc_pst_t *p = (rappc_pst_t *)ra_ppc_pst;
+	const rappc_slot_hdr_t *h;
+	u32 L, seq, n, base, i;
+	const rappc_head_t *hd = (const rappc_head_t *)RAPPC_BASE_PHYS;
+
+	ra_ppc_cur = RAPPC_NO_SLOT;
+	if (!ra_ppc_on())
+		return 0;
+	/* integrity: the image header must still be ours */
+	sync_before_read((void *)RAPPC_BASE_PHYS, 32);
+	if (hd->magic != RAPPC_MAGIC || hd->entry != ra_ppc_entry_ea) {
+		ra_ppc_drop_stub();
+		ra_debug("GC-RA PPC agent image overwritten -> OFF, Starlet path");
+		return 0;
+	}
+	sync_before_read((void *)ra_ppc_pst, sizeof(rappc_pst_t));
+	L = p->latest;
+	seq = p->seq;
+	if (L >= RAPPC_NSLOT) { ra_ppc_sk_seq++; return -1; }
+#if RA_USE_RETRACE
+	if (seq != ra_rt_last) {
+		u32 step = seq - ra_rt_last;
+		if (step == 0 || step > 3u) { ra_ppc_sk_seq++; return -1; }
+		/* the agent already sampled a newer retrace than the one we woke on:
+		 * number this snapshot by the frame it really holds */
+		ra_game_frame += step;
+		ra_rt_last = seq;
+		ra_ppc_ahead++;
+	}
+#endif
+	base = ra_ppc_slot[L];
+	h = (const rappc_slot_hdr_t *)base;
+	sync_before_read((void *)base, 32);
+	if (h->seq != seq || h->done != (seq ? seq : 1u)) { ra_ppc_sk_torn++; return -1; }
+	if (ra_ppc_dirty_chain || h->chain_gen != ra_ppc_chain_gen ||
+	    h->node_count != ra_chain_node_count) { ra_ppc_sk_gen++; return -1; }
+	if (ra_chain_node_count > 0 && h->hist != ra_ppc_committed) { ra_ppc_sk_hist++; return -1; }
+	if (ra_ppc_dirty_full || h->flat_gen < ra_ppc_prefix_gen || h->flat_count > count) {
+		ra_ppc_sk_gen++;
+		return -1;
+	}
+	n = h->flat_count;
+	if (n) {
+		sync_before_read((void *)(base + RAPPC_SL_VALS), n);
+		memcpy(vals, (const void *)(base + RAPPC_SL_VALS), n);
+	}
+	/* entries appended after that walk: read here (as before, first frame only) */
+	for (i = n; i < count; i++)
+		vals[i] = ra_read_mem1(ra_watchlist[i]);
+	ra_ppc_tail += count - n;
+	if (ra_chain_node_count > 0) {
+		u32 nb = (u32)ra_chain_node_count * 4u;
+		sync_before_read((void *)(base + RAPPC_SL_NVAL),   nb);
+		sync_before_read((void *)(base + RAPPC_SL_NPREV),  nb);
+		sync_before_read((void *)(base + RAPPC_SL_NPRIOR), nb);
+		sync_before_read((void *)(base + RAPPC_SL_NVALID), 2u * (RAPPC_MAX_NODES / 8u));
+	}
+	ra_ppc_cur = L;
+	ra_ppc_cur_seq = seq;
+	return 1;
+}
+
+/* still the same walk after we read it? (the agent never writes the newest
+ * slot, but a late fire could see it reused) */
+static int ra_ppc_still(void)
+{
+	const rappc_slot_hdr_t *h = (const rappc_slot_hdr_t *)ra_ppc_slot[ra_ppc_cur];
+	sync_before_read((void *)ra_ppc_slot[ra_ppc_cur], 32);
+	return h->seq == ra_ppc_cur_seq && h->done == (ra_ppc_cur_seq ? ra_ppc_cur_seq : 1u);
+}
+#endif
+
 /* Read all watchlist values from MEM1 and ship a SNAPSHOT (v3 header:
  * flat values + Phase C chain window bitmap/blob + Phase D dp sections —
  * faithful port of the canonical d2x ra_send_snapshot). With no chain
@@ -1156,6 +1705,10 @@ static int ra_send_snapshot(void)
 
 	u16 win_first = 0, win_count = 0;
 	u32 blob_len = 0, bm_bytes = 0;
+	/* chain section sources: the Starlet's walk, or the agent's slot */
+	const u32 *cval = ra_chain_values, *cprev = ra_chain_values_prev, *cprior = ra_chain_prior;
+	const u8  *cvb  = ra_chain_node_valid, *cvbp = ra_chain_valid_prev;
+	int ppc = 0;
 
 #if RA_SNAP_TEST_CAP
 	if (count > RA_SNAP_TEST_CAP) count = RA_SNAP_TEST_CAP;
@@ -1164,13 +1717,48 @@ static int ra_send_snapshot(void)
 	hdr->magic       = RA_MAGIC_GC_TO_ESP;
 	hdr->command     = RA_CMD_SNAPSHOT;
 	++ra_frame_counter;                          /* delivery count */
+	u32 ph0 = read32(HW_TIMER), ph1;
+	ra_wb_publish();                             /* last snapshot's lines -> PPC dcbst list */
+	ph1 = read32(HW_TIMER); ra_ph_pub += ph1 - ph0; ph0 = ph1;
+	ra_fresh_epoch = (ra_fresh_epoch >= RA_FRESH_EP_MASK) ? 1u : ra_fresh_epoch + 1u;   /* = ra_wb_publish's ne */
+	if (ra_fresh_epoch == 1u)
+		memset(ra_fresh_tab, 0, sizeof(ra_fresh_tab));   /* epoch wrap: no stale tag can match */
+#if RA_PPC_AGENT
+	ppc = ra_ppc_take(vals, count);
+	if (ppc < 0) {
+		/* not exactly buildable this fire: skip it (counted), publish the
+		 * pending changes so the next retrace's walk has them */
+		if (++ra_ppc_bad_run >= RA_PPC_FAIL_SKIPS)
+			ra_ppc_failed = 1;
+		ra_ppc_after(RAPPC_NO_SLOT);
+		--ra_frame_counter;
+		ra_ph_val += read32(HW_TIMER) - ph0;
+		return -1;
+	}
+	if (ppc > 0) {
+		u32 b = ra_ppc_slot[ra_ppc_cur];
+		ra_ppc_bad_run = 0;
+		ra_ppc_used++;
+		cval   = (const u32 *)(b + RAPPC_SL_NVAL);
+		cprev  = (const u32 *)(b + RAPPC_SL_NPREV);
+		cprior = (const u32 *)(b + RAPPC_SL_NPRIOR);
+		cvb    = (const u8  *)(b + RAPPC_SL_NVALID);
+		cvbp   = (const u8  *)(b + RAPPC_SL_NVP);
+	} else if (ra_ppc_was_on) {
+		ra_chain_have_prev = 0;   /* back on the Starlet path: its history is stale */
+	}
+	ra_ppc_was_on = (ppc > 0);
+#endif
 	snap->frame_counter = ra_game_frame;         /* real-time 60 Hz frame clock */
 	snap->addr_count    = count;
 	snap->wl_seq        = ra_wl_seq;             /* Phase D2 sync echo */
-	for (i = 0; i < count; i++)
-		vals[i] = ra_read_mem1(ra_watchlist[i]);
-	if (ra_chain_node_count > 0)
+	if (!ppc)
+		for (i = 0; i < count; i++)
+			vals[i] = ra_read_mem1(ra_watchlist[i]);
+	ph1 = read32(HW_TIMER); ra_ph_val += ph1 - ph0; ph0 = ph1;
+	if (!ppc && ra_chain_node_count > 0)
 		ra_chain_walk();
+	ph1 = read32(HW_TIMER); ra_ph_chn += ph1 - ph0; ph0 = ph1;
 
 	/* Phase C chain window — greedy fill from the rotating cursor until the
 	 * 8192B transaction budget is hit; next frame resumes where we stopped
@@ -1207,9 +1795,9 @@ static int ra_send_snapshot(void)
 				u16 node = ra_chain_ship_node[win_first + wi];
 				const ra_chain_node_t *n = &ra_chain_nodes[node];
 				u8  w = (u8)(((n->op >> 5) & 3) + 1);
-				u32 v = ra_chain_values[node];
+				u32 v = cval[node];
 				u8  k;
-				if (ra_chain_node_valid[node >> 3] & (1u << (node & 7)))
+				if (cvb[node >> 3] & (1u << (node & 7)))
 					bm[wi >> 3] |= (u8)(1u << (wi & 7));
 				for (k = 0; k < w; k++)
 					blob[k] = (u8)(v >> (8u * k));
@@ -1236,12 +1824,12 @@ static int ra_send_snapshot(void)
 		for (di = 0; di < ra_chain_dp_count; di++) {
 			u16 node = ra_chain_dp_node[di];
 			u32 dv = (ra_chain_dp_kind[di] == RA_CN_DP_PRIOR)
-			         ? ra_chain_prior[node]
-			         : ra_chain_values_prev[node];
+			         ? cprior[node]
+			         : cprev[node];
 			memcpy(dp + (u32)di * 4u, &dv, 4);   /* Starlet is BE = wire order */
 			/* validity of the shipped value = the parent RESOLVED at walk
 			 * N-1 (values_prev meaningful). ESP skips the compare on 0. */
-			if (ra_chain_valid_prev[node >> 3] & (1u << (node & 7)))
+			if (cvbp[node >> 3] & (1u << (node & 7)))
 				dpv[di >> 3] |= (u8)(1u << (di & 7));
 		}
 	}
@@ -1255,10 +1843,72 @@ static int ra_send_snapshot(void)
 	       + ((u32)ra_chain_dp_count + 7u) / 8u;
 	rx_len = RA_SNAP_TEST_READ ? RA_SNAP_TEST_READ : RA_RESP_LEN;
 	memset(ra_snap_rx, 0, sizeof(ra_snap_rx));
-	if (ra_phase_b(ra_snap_tx, tx_len, ra_snap_rx, rx_len) < 0) return -1;
+#if RA_PPC_AGENT
+	if (ppc > 0 && !ra_ppc_still()) {
+		ra_ppc_sk_torn++;
+		ra_ppc_after(RAPPC_NO_SLOT);
+		--ra_frame_counter;
+		ra_ph_bld += read32(HW_TIMER) - ph0;
+		return -1;
+	}
+#endif
+	ph1 = read32(HW_TIMER); ra_ph_bld += ph1 - ph0; ph0 = ph1;
+#if RA_USB_PIPELINE
+	if (ra_usb) {
+		/* pipelined: on the wire now, reply collected by ra_snap_collect at
+		 * the next fire (before anything else touches the link) */
+		s32 pr = RA_UsbLink_Post(ra_snap_tx, tx_len, ra_snap_rx, sizeof(ra_snap_rx));
+		ra_ph_xfr += read32(HW_TIMER) - ph0;
+#if RA_PPC_AGENT
+		/* sent -> this walk is the ESP's "previous frame" from now on */
+		ra_ppc_after((pr >= 0 && ppc > 0) ? ra_ppc_cur : RAPPC_NO_SLOT);
+#endif
+		return (pr < 0) ? -1 : 0;
+	}
+#endif
+	{
+		int pr = ra_phase_b(ra_snap_tx, tx_len, ra_snap_rx, rx_len);
+		ra_ph_xfr += read32(HW_TIMER) - ph0;
+		if (pr < 0) {
+#if RA_PPC_AGENT
+			ra_ppc_after(RAPPC_NO_SLOT);
+#endif
+			return -1;
+		}
+	}
 	ra_parse_response(ra_snap_rx);
+#if RA_PPC_AGENT
+	ra_ppc_after(ppc > 0 ? ra_ppc_cur : RAPPC_NO_SLOT);
+#endif
 	return 0;
 }
+
+#if RA_USB_PIPELINE
+/* Collect + parse the reply to the snapshot posted at the previous fire.
+ * 0 = the link is free for this fire (parsed, or nothing was posted, or that
+ * exchange failed and just lost its reply); <0 = still in flight after the
+ * timeout (skip this fire, like a blocking exchange that timed out). */
+static u32 ra_pipe_wait_t = 0;   /* ticks spent waiting for replies (diag) */
+/* loop split (ticks): collect (reap+parse), ADDR rounds + resync, snapshot,
+ * retrace wait; ADDR rounds sent */
+static u32 ra_lp_col = 0, ra_lp_mid = 0, ra_lp_snp = 0, ra_lp_rtw = 0, ra_lp_nq = 0;
+static int ra_snap_collect(void)
+{
+	s32 r;
+	u32 t0;
+
+	if (!RA_UsbLink_Posted())
+		return 0;
+	t0 = read32(HW_TIMER);
+	r = RA_UsbLink_Reap(RA_USB_TIMEOUT_MS);
+	ra_pipe_wait_t += read32(HW_TIMER) - t0;
+	if (r == RA_USBL_ETIMEOUT)
+		return -1;
+	if (r == 0)
+		ra_parse_response(ra_snap_rx);
+	return 0;
+}
+#endif
 
 /* Answer a pending ADDR_QUERY by reading the requested addrs from MEM1. */
 static int ra_send_addr_response(void)
@@ -1401,6 +2051,9 @@ static u32 RA_PollThread(void *arg)
 			}
 			if (ra_rt_state == RT_LIVE) {
 				u32 t0 = read32(HW_TIMER), rc = ra_read_rt();
+#if RA_USB_PIPELINE
+				u32 rtw0 = t0;
+#endif
 				/* Frame-boundary sampling: sleep until the next vertical retrace
 				 * (udelay is an IOS timer sleep, not a spin), at most 3 frames. */
 				while (rc == ra_rt_last && (read32(HW_TIMER) - t0) < RA_FRAME_TICKS * 3u) {
@@ -1408,8 +2061,18 @@ static u32 RA_PollThread(void *arg)
 					rc = ra_read_rt();
 				}
 				hw_frame = (read32(HW_TIMER) - ra_start_tick) / RA_FRAME_TICKS;
+#if RA_USB_PIPELINE
+				ra_lp_rtw += read32(HW_TIMER) - rtw0;
+#endif
 				if (rc != ra_rt_last) {
-					ra_game_frame += rc - ra_rt_last;
+					u32 step = rc - ra_rt_last;
+					if (step > RA_CLOCK_MAX_STEP) {   /* re-init, not time */
+						step = hw_frame - ra_rt_last_hw;
+						if (step == 0 || step > RA_CLOCK_MAX_STEP) step = 1;
+						ra_clock_resets++;
+						ra_debug("GC-RA retrace counter re-init -> clock kept monotonic");
+					}
+					ra_game_frame += step;
 					ra_rt_last     = rc;
 					ra_rt_last_hw  = hw_frame;
 					rt_used = 1;
@@ -1457,8 +2120,16 @@ static u32 RA_PollThread(void *arg)
 				}
 				/* Accumulate deltas so the frame clock never jumps back when the
 				 * source switches (the ESP keys its warm-up and debt on it). */
-				if (!rt_used)
-					ra_game_frame += ra_vbi_live ? (vbi - prev_vbi) : (hw_frame - ra_prev_hw);
+				if (!rt_used) {
+					u32 step = ra_vbi_live ? (vbi - prev_vbi) : (hw_frame - ra_prev_hw);
+					if (ra_vbi_live && step > RA_CLOCK_MAX_STEP) {   /* VBI re-init, not time */
+						step = hw_frame - ra_prev_hw;
+						if (step > RA_CLOCK_MAX_STEP) step = 1;
+						ra_clock_resets++;
+						ra_debug("GC-RA VBI counter re-init -> clock kept monotonic");
+					}
+					ra_game_frame += step;
+				}
 				ra_prev_hw = hw_frame;
 				ra_vbi_last = vbi;
 			}
@@ -1466,7 +2137,44 @@ static u32 RA_PollThread(void *arg)
 			ra_game_frame = hw_frame;
 #endif
 
-			(void)ra_send_snapshot();
+#if RA_USB_PIPELINE && !RA_SNAP_TEST_CAP
+			if (ra_usb) {
+				/* PIPELINE: last fire's reply first (it may carry ADDR_QUERY /
+				 * mutations / a RESYNC), its ADDR_RESPONSE rounds and the resync
+				 * next, and only then this fire's snapshot goes on the wire —
+				 * the same sequence the ESP sees with the blocking exchange.
+				 * Still in flight = skip the fire. */
+				u32 st0 = read32(HW_TIMER), dt, s1, s2;
+				if (ra_snap_collect() == 0) {
+					s1 = read32(HW_TIMER); ra_lp_col += s1 - st0;
+					for (i = 0; i < 12 && ra_pending_qn > 0; i++) {
+						(void)ra_send_addr_response();
+						ra_lp_nq++;
+					}
+					if (ra_resync_pending) {
+						ra_resync_pending = 0;
+						if (ra_fetch_watchlist() == 0) {
+							ra_wl_seq = ra_resync_seq;
+							ra_debug("GC-RA RESYNC: watchlist re-fetched");
+						}
+					}
+					s2 = read32(HW_TIMER); ra_lp_mid += s2 - s1;
+					(void)ra_send_snapshot();
+					ra_lp_snp += read32(HW_TIMER) - s2;
+				}
+				dt = read32(HW_TIMER) - st0;
+				ra_snap_t_sum += dt; ra_snap_t_n++;
+				if (dt > ra_snap_t_max) ra_snap_t_max = dt;
+			} else
+#endif
+			{
+			{
+				u32 st0 = read32(HW_TIMER), dt;
+				(void)ra_send_snapshot();
+				dt = read32(HW_TIMER) - st0;
+				ra_snap_t_sum += dt; ra_snap_t_n++;
+				if (dt > ra_snap_t_max) ra_snap_t_max = dt;
+			}
 #if !RA_SNAP_TEST_CAP
 			for (i = 0; i < 12 && ra_pending_qn > 0; i++)
 				(void)ra_send_addr_response();
@@ -1486,6 +2194,7 @@ static u32 RA_PollThread(void *arg)
 			ra_pending_qn = 0;
 			ra_resync_pending = 0;
 #endif
+			}   /* blocking exchange */
 
 			/* Keep the disc-slot LED exclusively ours: force Nintendont's
 			 * disk-access indicator off so it can't drive the slot LED (it would
@@ -1523,6 +2232,116 @@ static u32 RA_PollThread(void *arg)
 				}
 			} else {
 				led_off();   /* normal gameplay: LED off */
+			}
+
+			/* Cache-refresh diag (its own short line: the heartbeat buffer
+			 * below is already near its 128-byte worst case). */
+			{
+				static u32 fs_beat = 0;
+				if (++fs_beat >= 300) {
+					char fm[96]; u32 fo = 0; const char *fp = "GC-RA fresh lines=";
+					fs_beat = 0;
+					while (*fp) fm[fo++] = *fp++;
+					fo += ra_appdec(fm + fo, ra_fresh_syncs);
+					fm[fo++] = ' '; fm[fo++] = 'w'; fm[fo++] = 'b'; fm[fo++] = '=';
+					fo += ra_appdec(fm + fo, ra_wb_lines_pub);   /* lines */
+					fm[fo++] = '/';
+					fo += ra_appdec(fm + fo, ra_wb_pub);         /* runs */
+					fm[fo++] = '/';
+					fo += ra_appdec(fm + fo, ra_wb_cap);         /* run cap */
+					/* snapshot time on the Starlet, us (HW_TIMER ~1.898 MHz) */
+					fm[fo++] = ' '; fm[fo++] = 's'; fm[fo++] = 'u'; fm[fo++] = 's'; fm[fo++] = '=';
+					fo += ra_appdec(fm + fo, ra_snap_t_n ? (ra_snap_t_sum / ra_snap_t_n) * 527u / 1000u : 0);
+					fm[fo++] = '/';
+					fo += ra_appdec(fm + fo, ra_snap_t_max * 527u / 1000u);
+					fm[fo] = 0;
+					ra_debug(fm);
+					/* phase split, avg us/snapshot: pub val chn bld xfr */
+					{
+						u32 nn = ra_snap_t_n ? ra_snap_t_n : 1u;
+						fo = 0; fp = "GC-RA snap us pub/val/chn/bld/xfr=";
+						while (*fp) fm[fo++] = *fp++;
+						fo += ra_appdec(fm + fo, (ra_ph_pub / nn) * 527u / 1000u); fm[fo++] = '/';
+						fo += ra_appdec(fm + fo, (ra_ph_val / nn) * 527u / 1000u); fm[fo++] = '/';
+						fo += ra_appdec(fm + fo, (ra_ph_chn / nn) * 527u / 1000u); fm[fo++] = '/';
+						fo += ra_appdec(fm + fo, (ra_ph_bld / nn) * 527u / 1000u); fm[fo++] = '/';
+						fo += ra_appdec(fm + fo, (ra_ph_xfr / nn) * 527u / 1000u);
+#if RA_USB_PIPELINE
+						/* pipeline: avg wait for the previous reply (0 = it was
+						 * already back when the retrace fired) */
+						if (ra_usb) {
+							fp = " wt="; while (*fp) fm[fo++] = *fp++;
+							fo += ra_appdec(fm + fo, (ra_pipe_wait_t / nn) * 527u / 1000u);
+							ra_pipe_wait_t = 0;
+						}
+#endif
+						fm[fo] = 0;
+						ra_ph_pub = ra_ph_val = ra_ph_chn = ra_ph_bld = ra_ph_xfr = 0;
+#if RA_USB_PIPELINE
+						/* loop split, avg us/fire: collect / ADDR+resync / snapshot /
+						 * retrace wait, and ADDR rounds in the window */
+						if (ra_usb) {
+							ra_debug(fm);
+							fo = 0; fp = "GC-RA loop us col/mid/snp/rtw=";
+							while (*fp) fm[fo++] = *fp++;
+							fo += ra_appdec(fm + fo, (ra_lp_col / nn) * 527u / 1000u); fm[fo++] = 0x2F;
+							fo += ra_appdec(fm + fo, (ra_lp_mid / nn) * 527u / 1000u); fm[fo++] = 0x2F;
+							fo += ra_appdec(fm + fo, (ra_lp_snp / nn) * 527u / 1000u); fm[fo++] = 0x2F;
+							fo += ra_appdec(fm + fo, (ra_lp_rtw / nn) * 527u / 1000u);
+							fp = " nq="; while (*fp) fm[fo++] = *fp++;
+							fo += ra_appdec(fm + fo, ra_lp_nq);
+							fp = " n="; while (*fp) fm[fo++] = *fp++;
+							fo += ra_appdec(fm + fo, nn);
+							fm[fo] = 0;
+							ra_lp_col = ra_lp_mid = ra_lp_snp = ra_lp_rtw = ra_lp_nq = 0;
+						}
+#endif
+#if RA_PPC_AGENT
+						/* PPC agent: fires that used the slot / skipped (seq, gen,
+						 * torn, hist) / tail reads / agent us per walk (timebase
+						 * 60.75 MHz) / walks + agent-side skips in the window */
+						if (ra_ppc_ready) {
+							rappc_pst_t *pp = (rappc_pst_t *)ra_ppc_pst;
+							u32 runs, tsum, skp;
+							sync_before_read((void *)ra_ppc_pst, sizeof(rappc_pst_t));
+							runs = pp->runs - ra_ppc_runs0;
+							tsum = pp->t_sum - ra_ppc_tsum0;
+							skp  = pp->skipped - ra_ppc_skip0;
+							ra_ppc_runs0 = pp->runs; ra_ppc_tsum0 = pp->t_sum; ra_ppc_skip0 = pp->skipped;
+							ra_debug(fm);
+							fo = 0; fp = "GC-RA ppc used=";
+							while (*fp) fm[fo++] = *fp++;
+							fo += ra_appdec(fm + fo, ra_ppc_used);
+							fp = " sk="; while (*fp) fm[fo++] = *fp++;
+							fo += ra_appdec(fm + fo, ra_ppc_sk_seq);  fm[fo++] = 0x2F;
+							fo += ra_appdec(fm + fo, ra_ppc_sk_gen);  fm[fo++] = 0x2F;
+							fo += ra_appdec(fm + fo, ra_ppc_sk_torn); fm[fo++] = 0x2F;
+							fo += ra_appdec(fm + fo, ra_ppc_sk_hist);
+							fp = " tail="; while (*fp) fm[fo++] = *fp++;
+							fo += ra_appdec(fm + fo, ra_ppc_tail);
+							fp = " us="; while (*fp) fm[fo++] = *fp++;
+							fo += ra_appdec(fm + fo, runs ? (tsum / runs) * 100u / 6075u : 0);
+							fm[fo++] = 0x2F;
+							fo += ra_appdec(fm + fo, pp->t_max * 100u / 6075u);
+							fp = " w="; while (*fp) fm[fo++] = *fp++;
+							fo += ra_appdec(fm + fo, runs); fm[fo++] = 0x2F;
+							fo += ra_appdec(fm + fo, skp);
+							fp = ra_ppc_failed ? " OFF" : (ra_ppc_on() ? " on" : " wait");
+							while (*fp) fm[fo++] = *fp++;
+#if RA_USE_RETRACE
+							/* hook point: x = handler exit (after the flip), s = retraceCount store */
+							fp = (ra_rt_hook_at && ra_rt_hook_at != ra_rt_target) ? " hk=x" : " hk=s";
+							while (*fp) fm[fo++] = *fp++;
+#endif
+							fm[fo] = 0;
+							ra_ppc_used = ra_ppc_sk_seq = ra_ppc_sk_gen = ra_ppc_sk_torn = 0;
+							ra_ppc_sk_hist = ra_ppc_tail = ra_ppc_ahead = 0;
+						}
+#endif
+					}
+					ra_snap_t_sum = ra_snap_t_max = ra_snap_t_n = 0;
+					ra_debug(fm);
+				}
 			}
 
 			/* Heartbeat once a second: alive + count + applied seq. */
@@ -1833,6 +2652,7 @@ static int ra_load_game(const char *game_id6, const char *md5_hex)
 	} tx;
 	u8  rx[sizeof(ra_esp_header_t)];
 	int attempt;
+	u8  last_st = 0xFF;
 
 	tx.hdr.magic       = RA_MAGIC_GC_TO_ESP;
 	tx.hdr.command     = RA_CMD_LOAD_GAME;
@@ -1862,6 +2682,16 @@ static int ra_load_game(const char *game_id6, const char *md5_hex)
 			return 0;
 		if (st == RA_STATUS_PORTAL || RA_STATUS_IS_ERROR(st))
 			return (int)st;
+		if (st == RA_STATUS_PROCESSING && last_st != RA_STATUS_PROCESSING) {
+			/* Download done, the adapter is parsing the set: that is progress,
+			 * so the 90 s window starts over (Zelda Collector's Edition parsed
+			 * for 80 s after a 7 s download and timed out by 0.1 s, 2026-11-15).
+			 * Only on the transition: at most download + 90 s in total. */
+			attempt = 0;
+			BootStatus(17, 0, 0);
+			ra_debug("GC-RA achievements downloaded -> adapter processing");
+		}
+		last_st = st;
 	}
 	return -1;
 }
