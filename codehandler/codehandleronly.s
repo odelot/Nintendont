@@ -65,6 +65,48 @@ _start:
 	stw	r5, 0x1004(r12)
 ra_no_tick:
 
+	# PPC WRITE-BACK for the RA snapshot (2026-11-15, Zelda Collector's Edition).
+	# The PPC cache is write-back: a tiny, hot working set (an NES emulator's RAM)
+	# never leaves L1/L2, so MEM1 — what the Starlet reads — kept the RAM-init
+	# pattern for the whole session. The Starlet publishes the 32-byte lines its
+	# last snapshot read (EA list, uncached) at 0xC0001060 (+count at 0x1064);
+	# dcbst each so MEM1 holds this frame's data. Everything is validated: count
+	# <= 256, list in the uncached view, each line in MEM1 (0x80/0x81) — dcbst/lwz
+	# on an unmapped EA would DSI. r5/r9/r10/r11 + ctr are saved/restored above.
+	lwz	r9, 0x1064(r12)		# line count
+	cmplwi	r9, 0
+	beq	ra_wb_done
+	cmplwi	r9, 512
+	bgt	ra_wb_done
+	lwz	r10, 0x1060(r12)	# list base (uncached EA)
+	rlwinm	r11, r10, 0, 0, 3	# top nibble
+	lis	r5, 0xC000
+	cmpw	r11, r5
+	bne	ra_wb_done
+	# Each entry is a RUN: EA of the first line | (lines-1) in the 5 low bits
+	# (a 32-byte-aligned EA has them free) -> up to 32 lines (1 KB) per entry.
+	mtctr	r9
+ra_wb_loop:
+	lwz	r11, 0(r10)		# run entry
+	rlwinm	r5, r11, 8, 24, 31	# top byte
+	cmplwi	r5, 0x80
+	beq	ra_wb_ok
+	cmplwi	r5, 0x81
+	bne	ra_wb_next
+ra_wb_ok:
+	rlwinm	r9, r11, 0, 27, 31	# r9 = lines - 1
+	rlwinm	r11, r11, 0, 0, 26	# r11 = first line EA
+ra_wb_run:
+	dcbst	0, r11
+	addi	r11, r11, 32
+	addic.	r9, r9, -1
+	bge	ra_wb_run
+ra_wb_next:
+	addi	r10, r10, 4
+	bdnz	ra_wb_loop
+	sync
+ra_wb_done:
+
 	# Draw the badge only while the Starlet has the trophy flag set (during the
 	# achievement celebration; the kernel toggles it in sync with the LED → the
 	# badge blinks 3x on unlock, like the WiiFlow trophy).

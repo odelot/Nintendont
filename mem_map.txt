@@ -63,6 +63,8 @@ MEM2
 0x93060000-0x93100000=IOS Interface Data Buffers
 0x93100000-0x93150000=ipl fonts buffer (0x1aff00-0x1fff00)
 0x93160000-0x93160008=OSReport (patch_fwrite)
+0x93170000-0x931BE000=RA PPC agent (kernel/rappc: code, CTL/PST, tables, slots, stack)
+0x931BE000-0x931C0000=RA snapshot tx buffer (Starlet only)
 0x931C0000=PSO PRS dol location
 0x931C0020=PSO PRS extract function location
 0x931C1800-0x931C3000=replacement memory for 0x80001800-0x80003000

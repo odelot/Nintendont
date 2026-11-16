@@ -13,7 +13,7 @@ endif
 
 SUBPROJECTS := multidol kernel/asm resetstub \
 	fatfs/libfat-arm.a fatfs/libfat-ppc.a \
-	codehandler kernel kernelboot \
+	codehandler kernel/rappc kernel kernelboot \
 	loader/source/ppc/PADReadGC loader/source/ppc/IOSInterface loader
 .PHONY: all forced clean $(SUBPROJECTS)
 
@@ -56,7 +56,13 @@ codehandler:
 	@echo " "
 	$(MAKE) -C codehandler
 
-kernel: kernel/asm fatfs/libfat-arm.a codehandler
+kernel/rappc:
+	@echo " "
+	@echo "Building RA PPC agent"
+	@echo " "
+	$(MAKE) -C kernel/rappc
+
+kernel: kernel/asm fatfs/libfat-arm.a codehandler kernel/rappc
 	@echo " "
 	@echo "Building Nintendont kernel"
 	@echo " "
@@ -96,6 +102,7 @@ clean:
 	$(MAKE) -C fatfs -f Makefile.arm clean
 	$(MAKE) -C fatfs -f Makefile.ppc clean
 	$(MAKE) -C codehandler clean
+	$(MAKE) -C kernel/rappc clean
 	$(MAKE) -C kernel clean
 	$(MAKE) -C kernelboot clean
 	$(MAKE) -C loader/source/ppc/PADReadGC clean

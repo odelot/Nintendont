@@ -74,12 +74,50 @@
  * zeroed and unused without a GCT; the stub is rewritten after every copy).
  * ------------------------------------------------------------------------ */
 #define RA_USE_RETRACE        1
+
+/* USB PIPELINE (2026-11-15, default ON; 0 = the blocking exchange as before).
+ * Majora's Mask: the blocking SNAPSHOT exchange (~5 KB out + the ESP's reply)
+ * took 13.7 of the RA loop's 20.5 ms, so the console posted only ~47
+ * snapshots/s and ~20% of the game frames were never sent. Pipelined (the d2x
+ * RAMOD design): the snapshot is put on the wire and the loop returns to the
+ * retrace wait; the NEXT fire first collects that reply, answers its
+ * ADDR_QUERY rounds and any resync, and only then posts its own snapshot — the
+ * exact message order the ESP sees with the blocking exchange. Sampling is
+ * unchanged (right after the retrace). USB link only; EXI is always blocking. */
+/* PPC AGENT (2026-11-15, default ON; 0 = the Starlet reads + walks as before).
+ * The Broadway gathers the watched bytes and walks the Phase C/D chains at
+ * every vertical retrace (kernel/rappc, called from the retraceCount++ stub),
+ * through its own coherent cache, into a MEM2 slot; the Starlet only copies
+ * the slot into the SNAPSHOT (wire format unchanged). Majora's Mask: the
+ * Starlet spent ~9.5 ms/frame on reads + walk + PPC cache coherency, more than
+ * the ~5.7 ms Nintendont's emulation loop and the IOS leave it. Needs the
+ * retrace hook (RA_USE_RETRACE); any inconsistency skips that fire (counted on
+ * the "GC-RA ppc" line), and a persistent failure turns it off for the session
+ * (back to the Starlet path). */
+#ifndef RA_PPC_AGENT
+#define RA_PPC_AGENT          1
+#endif
+
+#ifndef RA_USB_PIPELINE
+#define RA_USB_PIPELINE       1
+#endif
 #define RA_RETRACE_SLOT_PHYS  0x1020u   /* u32 retraceCount mirror (PPC writes uncached) */
 #define RA_RETRACE_STUB_PHYS  0x1040u   /* 8-instruction stub */
+#define RA_RETRACE_EXIT_STUB_PHYS 0x1068u /* 11-instruction PPC-agent stub (0x1068-0x1093) */
+
+/* SNAPSHOT tx buffer: MEM2, at the tail of the RA area (rappc/rappc_shared.h:
+ * 0x13170000-0x131BFFFF, the PPC agent image first), page aligned, Starlet-only. */
+#define RA_SNAP_TX_PHYS       0x131BE000u
+#define RA_SNAP_TX_SIZE       8192u
 
 /* Find + hook the game's retraceCount++ (see above). buf/len = the code just
  * patched by DoPatches (the main DOL on the call that matters). */
 void RA_RetraceHook(u32 buf, u32 len);
+
+/* PPC write-back list (step 2, 2026-11-15): Patch.c hands RA the zeroed cheats
+ * area right after installing the codehandler ([lo, hi) = above the codelist,
+ * below the patch area). 0,0 = none (GCT loaded / debugger): no write-back. */
+void RA_SetFlushArea(u32 lo, u32 hi);
 
 /* RA background-thread priority (2026-06-23): created at 0x78 (= main/DI/HID/BT/SO
  * tier) so the snapshot loop isn't preempted during its active EXI work — this

@@ -3809,6 +3809,10 @@ void DoPatches( char *Buffer, u32 Length, u32 DiscOffset )
 		 * scratch the copy above just zeroed, so this runs after every copy. */
 		if (raVbiForce && !debuggerWanted)
 			RA_RetraceHook((u32)Buffer, ((u32)Buffer == DOLMinOff) ? Length : 0); /* scan only the main DOL */
+		/* RA: the zeroed cheats area above the codelist holds the PPC write-back
+		 * list (ra_module.c) — only when no GCT will be copied there. */
+		if (raVbiForce && !debuggerWanted)
+			RA_SetFlushArea(cheatsWanted ? 0 : cheats_start + 8, cheatsWanted ? 0 : POffset);
 #endif
 		//copy in gct file if requested
 		if( cheatsWanted && TRIGame != TRI_SB && useipl == 0 )
